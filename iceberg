@@ -1,2 +1,603 @@
-Incremental Processing with Apache Iceberg & Spark: A Comprehensive Guide
-https://medium.com/@amitgil87/incremental-processing-with-apache-iceberg-spark-a-comprehensive-guide-ef2deaabe1f7
+import sys
+import boto3
+import json
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from pyspark.conf import SparkConf
+from awsglue.job import Job
+from urllib.parse import urlparse
+from datetime import datetime
+from typing import List, Optional, Dict, Any, Tuple
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import (input_file_name, current_timestamp,
+                                   date_format, col)
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from pyspark.conf import SparkConf
+import logging
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class S3ConfigManager:
+    def __init__(self, bucket: str, region: str):
+        """Initialize S3 Config Manager"""
+        self.bucket = bucket
+        self.s3_client = boto3.client('s3', region_name=region)
+
+    def read_schema(self, layer: str, table_name: str) -> Dict[str, Any]:
+        """Read schema from S3"""
+        try:
+            schema_path = f"config/{layer}/schema/{table_name}/schema.json"
+            response = self.s3_client.get_object(
+                Bucket=self.bucket,
+                Key=schema_path
+            )
+            schema = json.loads(response['Body'].read().decode('utf-8'))
+            logger.info(f"Successfully read schema for {table_name}")
+            return schema
+        except Exception as e:
+            logger.error(f"Error reading schema for {table_name}: {str(e)}")
+            raise
+
+    def read_merge_query(self, layer: str, table_name: str) -> str:
+        """Read merge query from S3"""
+        try:
+            query_path = f"config/{layer}/sql/{table_name}/merge_query.sql"
+            response = self.s3_client.get_object(
+                Bucket=self.bucket,
+                Key=query_path
+            )
+            query = response['Body'].read().decode('utf-8')
+            logger.info(f"Successfully read merge query for {table_name}")
+            return query
+        except Exception as e:
+            logger.error(f"Error reading merge query for {table_name}: {str(e)}")
+            raise
+
+    def load_checkpoint(self, layer: str, table_name: str) -> Optional[Dict[str, Any]]:
+        """Load checkpoint from S3"""
+        try:
+            checkpoint_path = f"checkpoints/{layer}/{table_name}_checkpoint.json"
+            try:
+                response = self.s3_client.get_object(
+                    Bucket=self.bucket,
+                    Key=checkpoint_path
+                )
+                checkpoint = json.loads(response['Body'].read().decode('utf-8'))
+                return checkpoint
+            except self.s3_client.exceptions.NoSuchKey:
+                logger.info(f"No checkpoint found for {table_name}")
+                return None
+        except Exception as e:
+            logger.error(f"Error loading checkpoint: {str(e)}")
+            raise
+
+    def save_checkpoint(self, layer: str, table_name: str, snapshot_id: str):
+        """Save checkpoint to S3"""
+        try:
+            checkpoint_path = f"checkpoints/{layer}/{table_name}_checkpoint.json"
+            checkpoint_data = {
+                'last_processed_snapshot': snapshot_id,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            self.s3_client.put_object(
+                Bucket=self.bucket,
+                Key=checkpoint_path,
+                Body=json.dumps(checkpoint_data)
+            )
+            logger.info(f"Saved checkpoint for {table_name}")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {str(e)}")
+            raise
+
+    def _parse_s3_path(self, s3_path: str) -> Tuple[str, str]:
+        """Parse S3 path into bucket and key"""
+        parsed = urlparse(s3_path)
+        return parsed.netloc, parsed.path.lstrip('/')
+
+    def list_s3_files(self, prefix: str, last_checkpoint_time: Optional[str] = None) -> List[str]:
+        """List S3 files in the specified prefix"""
+        try:
+            files = []
+            bucket, prefix = self._parse_s3_path(prefix)
+            logger.info(f"parse_s3_path :  {bucket} , {prefix}  ..")
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+
+            # Convert checkpoint time to datetime if provided
+            checkpoint_dt = None
+            if last_checkpoint_time:
+                try:
+                    checkpoint_dt = datetime.fromisoformat(last_checkpoint_time).replace(tzinfo=None)
+                    logger.info(f"checkpoint_dt  :  {checkpoint_dt}   ..")
+                except ValueError:
+                    logger.warning(f"Invalid checkpoint time format: {last_checkpoint_time}")
+
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    last_modified = obj['LastModified'].replace(tzinfo=None)
+                    logger.info(f"last_modified  :  {last_modified}   ..")
+                    if not checkpoint_dt or last_modified > checkpoint_dt:
+                        files.append(f"s3://{bucket}/{obj['Key']}")
+
+            logger.info(f"Found {len(files)} new files to process")
+            return files
+        except Exception as e:
+            logger.error(f"Error listing S3 files: {str(e)}")
+            raise
+
+    def _get_checkpoint_timestamp(self, checkpoint: Optional[Dict[str, Any]]) -> Optional[float]:
+        """Convert checkpoint timestamp to float if exists"""
+        if checkpoint and 'timestamp' in checkpoint:
+            try:
+                return datetime.fromisoformat(checkpoint['timestamp']).timestamp()
+            except ValueError:
+                logger.warning("Invalid timestamp format in checkpoint")
+        return None
+
+
+class IcebergTableProcessor:
+    def __init__(self, spark: SparkSession, args: Dict[str, str]):
+        """Initialize Iceberg Table Processor"""
+        self.spark = spark
+        self.args = args
+        self.layer = args['layer']
+        self.s3_config = S3ConfigManager(args['config_bucket'], args['aws_region'])
+
+        # Validate required arguments based on layer
+        self._validate_layer_args()
+
+    def _validate_layer_args(self):
+        """Validate layer-specific arguments"""
+        if self.layer == 'bronze' and 'raw_input_path' not in self.args:
+            raise ValueError("raw_input_path is required for bronze layer")
+
+        if not all(k in self.args for k in ['catalog_name', 'database_name', 'table_name']):
+            raise ValueError("Missing required table configuration arguments")
+
+    def get_new_data(self) -> Tuple[Optional[DataFrame], Optional[str]]:
+        """Get new data based on layer type"""
+        logger.info(f"Reading data from {self.layer}  ..")
+        try:
+            if self.layer == 'bronze':
+                return self._get_new_raw_files()
+            elif self.layer == 'silver':
+                return self._get_incremental_bronze_data()
+            else:
+                raise ValueError(f"Unsupported layer: {self.layer}")
+        except Exception as e:
+            logger.error(f"Error getting new data: {str(e)}")
+            raise
+
+    def _get_new_raw_files(self) -> Tuple[Optional[DataFrame], Optional[str]]:
+        """Process new raw files for bronze layer"""
+        try:
+            # Get last checkpoint
+            checkpoint = self.s3_config.load_checkpoint(
+                self.layer,
+                self.args['table_name']
+            )
+            last_checkpoint_time = checkpoint.get('last_processed_snapshot') if checkpoint else None
+            logger.info(f"last_checkpoint_time :  {last_checkpoint_time}  ..")
+
+            # Get new files
+            new_files = self.s3_config.list_s3_files(
+                self.args['raw_input_path'],
+                last_checkpoint_time
+            )
+
+            if not new_files:
+                logger.info("No new files to process")
+                return None, None
+
+            # Read and process files
+            df = self.spark.read.csv(path=new_files, sep=',', header=True, inferSchema=True)
+            current_time = datetime.now().isoformat()
+            return df, current_time
+
+        except Exception as e:
+            logger.error(f"Error processing raw files: {str(e)}")
+            raise
+
+    #TBD
+    def _read_input_files(self, files: List[str], config: Dict[str, Any]) -> DataFrame:
+        """Read input files based on configuration"""
+        file_format = config.get('file_format', 'csv')
+        read_options = config.get('read_options', {})
+
+        reader = self.spark.read.format(file_format)
+        for key, value in read_options.items():
+            reader = reader.option(key, value)
+
+        return reader.load(files)
+
+    def _get_incremental_bronze_data(self) -> Tuple[Optional[DataFrame], Optional[str]]:
+        """Get incremental data from bronze for silver layer"""
+        try:
+            source_table = f"{self.args['catalog_name']}.bronze_{self.args['database_name']}.{self.args['table_name']}"
+
+            # Get table history
+            history_df = self.spark.sql(f"SELECT * FROM {source_table}.history")
+            history_df.createOrReplaceTempView("table_history")
+
+            # Get latest snapshot
+            latest_snapshot = self.spark.sql(
+                "SELECT snapshot_id FROM table_history ORDER BY made_current_at DESC LIMIT 1"
+            ).collect()[0][0]
+
+            # Load checkpoint
+            checkpoint = self.s3_config.load_checkpoint(
+                self.layer,
+                self.args['table_name']
+            )
+
+            if checkpoint is None:
+                logger.info("No checkpoint found. Processing all data.")
+                df = self.spark.read.format("iceberg").table(source_table)
+                return df, str(latest_snapshot)
+
+            last_snapshot = checkpoint['last_processed_snapshot']
+
+            latest_snapshot = int(str(latest_snapshot).strip())
+            last_snapshot = int(str(last_snapshot).strip())
+
+            if latest_snapshot == last_snapshot:
+                logger.info("No new data to process")
+                return None, None
+
+            logger.info(f"Reading incremental data from {last_snapshot} to {latest_snapshot}")
+            try:
+                df = self.spark.read.format("iceberg") \
+                    .option("start-snapshot-id", last_snapshot) \
+                    .option("end-snapshot-id", latest_snapshot) \
+                    .load(source_table)
+            except Exception as e:
+                if "Found overwrite operation" in str(e):
+                    logger.warning("Found overwrite operation, reading latest snapshot")
+                    df = self.spark.read.format("iceberg") \
+                        .option("snapshot-id", latest_snapshot) \
+                        .table(source_table)
+                else:
+                    raise
+
+            return df, str(latest_snapshot)
+
+        except Exception as e:
+            logger.error(f"Error getting incremental data: {str(e)}")
+            raise
+
+    def transform_data(self, df: DataFrame) -> DataFrame:
+        """Transform data based on layer"""
+        try:
+            if self.layer == 'bronze':
+                return self._transform_bronze(df)
+            elif self.layer == 'silver':
+                return self._transform_silver(df)
+            else:
+                raise ValueError(f"Unsupported layer: {self.layer}")
+        except Exception as e:
+            logger.error(f"Error transforming data: {str(e)}")
+            raise
+
+    def _transform_bronze(self, df: DataFrame) -> DataFrame:
+        """Transform data for bronze layer"""
+        try:
+            # Add metadata columns
+            df = df.select(
+                "*",
+                input_file_name().alias("input_file"),
+                current_timestamp().alias("processed_time"),
+                date_format(current_timestamp(), "yyyy-MM-dd").alias("processed_date")
+            )
+
+            return df
+        except Exception as e:
+            logger.error(f"Error in bronze transformation: {str(e)}")
+            raise
+
+    def _transform_silver(self, df: DataFrame) -> DataFrame:
+        """Transform data for silver layer"""
+        try:
+            # Add processing metadata
+            df = df.drop("input_file", "processed_time", "processed_date")
+            df = df.withColumn("processed_time", current_timestamp())
+            return df
+        except Exception as e:
+            logger.error(f"Error in silver transformation: {str(e)}")
+            raise
+
+    def write_data(self, df: DataFrame, snapshot_id: str) -> bool:
+        """Write data to target table based on layer"""
+        try:
+            # Create namespace
+            namespace = f"{self.args['catalog_name']}.{self.layer}_{self.args['database_name']}"
+            sql_str = f"CREATE NAMESPACE IF NOT EXISTS {namespace}"
+            self.spark.sql(sql_str)
+            if self.layer == 'bronze':
+                success = self._write_bronze(df)
+            elif self.layer == 'silver':
+                success = self._write_silver(df)
+            else:
+                raise ValueError(f"Unsupported layer: {self.layer}")
+
+            if success:
+                self.s3_config.save_checkpoint(
+                    self.layer,
+                    self.args['table_name'],
+                    snapshot_id
+                )
+                return True
+            return False
+
+        except Exception as e:
+            logger.error(f"Error writing data: {str(e)}")
+            raise
+
+    def _write_bronze(self, df: DataFrame) -> bool:
+        """Write data to bronze table using append/overwrite"""
+        try:
+            target_table = f"{self.args['catalog_name']}.bronze_{self.args['database_name']}.{self.args['table_name']}"
+
+            # Initialize writer
+            writer = df.write.format("iceberg")
+            # Set table properties based on table type
+            if self.args.get('table_type', 'COW').upper() == 'COW':
+                writer = writer.option("write.format.default", "parquet") \
+                    .option("write.delete.mode", "copy-on-write") \
+                    .option("write.update.mode", "copy-on-write") \
+                    .option("write.merge.mode", "copy-on-write")
+            elif self.args.get('table_type').upper() == 'MOR':
+                writer = writer.option("write.format.default", "parquet") \
+                    .option("write.delete.mode", "merge-on-read") \
+                    .option("write.update.mode", "merge-on-read") \
+                    .option("write.merge.mode", "merge-on-read")
+            else:
+                raise ValueError("Invalid table_type. Must be 'COW' or 'MOR'.")
+
+            # Set compression codec if provided
+            if self.args.get('compression'):
+                writer = writer.option("write.parquet.compression-codec", self.args['compression'])
+
+            # Set partitioning if specified
+            if self.args.get('partition_cols'):
+                partition_cols = [col.strip() for col in self.args['partition_cols'].split(',')]
+                writer = writer.partitionBy(partition_cols)
+
+            # Write data based on table existence
+            if self.spark.catalog.tableExists(target_table):
+                writer.mode("append").saveAsTable(target_table)
+            else:
+                writer.mode("overwrite").saveAsTable(target_table)
+
+            logger.info(f"Successfully wrote data to bronze table: {target_table}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error writing to bronze table: {str(e)}")
+            raise
+
+
+    def _write_silver(self, df: DataFrame) -> bool:
+        """Write data to silver table using merge"""
+        try:
+            target_table = f"{self.args['catalog_name']}.silver_{self.args['database_name']}.{self.args['table_name']}"
+
+            # Check if table exists
+            table_exists = self.spark.catalog.tableExists(target_table)
+
+            if not table_exists:
+                logger.info(f"Creating new silver table: {target_table}")
+
+                # Create empty DataFrame with same schema
+                empty_df = self.spark.createDataFrame([], df.schema)
+
+                # Create table with properties
+                writer = empty_df.writeTo(target_table).using("iceberg") \
+                    .tableProperty("format-version", "2")
+
+                # Set table properties based on type
+                table_type = self.args.get('table_type', 'MOR').upper()
+                if table_type == 'MOR':
+                    writer = writer \
+                        .tableProperty("write.delete.mode", "merge-on-read") \
+                        .tableProperty("write.update.mode", "merge-on-read") \
+                        .tableProperty("write.merge.mode", "merge-on-read")
+                elif table_type == 'COW':
+                    writer = writer \
+                        .tableProperty("write.delete.mode", "copy-on-write") \
+                        .tableProperty("write.update.mode", "copy-on-write") \
+                        .tableProperty("write.merge.mode", "copy-on-write")
+
+                # Set partitioning if specified
+                if self.args.get('partition_cols'):
+                    partition_cols = [col.strip() for col in self.args['partition_cols'].split(',')]
+                    for col in partition_cols:
+                        if col in empty_df.columns:
+                            writer = writer.partitionedBy(col)
+
+                writer.create()
+                logger.info(f"Created new silver table: {target_table}")
+
+            # Register temporary view for merge
+            df.createOrReplaceTempView("__temp_silver_updates")
+
+            # Get merge query from config or use default
+            pk_columns = self.args.get('pk_columns')
+            merge_query = self._generate_merge_query(pk_columns,target_table)
+
+            # Execute merge operation
+            logger.info(f"Executing merge query: {merge_query}")
+            self.spark.sql(merge_query)
+            # Clean up temporary view
+            self.spark.catalog.dropTempView("__temp_silver_updates")
+            logger.info(f"Successfully merged data into silver table: {target_table}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error writing to silver table: {str(e)}")
+            raise
+
+    def _generate_merge_query(self,pk_columns_str, target_table):
+        # Split the comma-separated string into list and clean whitespace
+        pk_columns = [col.strip() for col in pk_columns_str.split(',')]
+
+        # Generate the PARTITION BY clause
+        partition_by = ', '.join(pk_columns)
+
+        # Generate the JOIN conditions
+        join_conditions = ' AND '.join([f"t.{col} = s.{col}" for col in pk_columns])
+
+        merge_query = f"""
+        MERGE INTO {target_table} t
+        USING (
+            SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY {partition_by}
+                ORDER BY processed_time DESC
+            ) as row_num
+            FROM __temp_silver_updates
+        ) s
+        ON {join_conditions}
+        WHEN MATCHED AND s.row_num = 1 THEN UPDATE SET *
+        WHEN NOT MATCHED AND s.row_num = 1 THEN INSERT *
+        """
+
+        return merge_query
+
+
+
+    def process(self) -> int:
+        """Main processing method"""
+        try:
+            # Get new data
+            df, snapshot_id = self.get_new_data()
+
+            if df is not None and snapshot_id is not None:
+                # Transform data
+                transformed_df = self.transform_data(df)
+                record_count = df.count()
+                logger.info(f"Retrieved {record_count} records to process")
+                # Write data
+                success = self.write_data(transformed_df, snapshot_id)
+                if success:
+                    logger.info("Records processed successfully")
+                    return 1
+                else:
+                    logger.info(" Processing Failed")
+                    return -1
+                #return success
+
+            else:
+                logger.info("No new data to process")
+                return 0
+
+        except Exception as e:
+            logger.error(f"Error in processessing: {str(e)}")
+            raise
+
+
+def validate_args(args: Dict[str, str]) -> None:
+    """Validate job arguments"""
+    required_args = {
+        'bronze': ['raw_input_path', 'catalog_name', 'database_name', 'table_name',
+                   'config_bucket', 'aws_region', 's3_table_bucket_arn'],
+        'silver': ['catalog_name', 'database_name', 'table_name',
+                   'config_bucket', 'aws_region', 's3_table_bucket_arn']
+    }
+
+    layer = args.get('layer')
+    if not layer:
+        raise ValueError("Layer must be specified")
+
+    missing_args = [arg for arg in required_args[layer] if arg not in args]
+    if missing_args:
+        raise ValueError(f"Missing required arguments for {layer} layer: {missing_args}")
+
+
+
+def get_job_args() -> Dict[str, str]:
+    """Get and validate job arguments"""
+    base_args = ['JOB_NAME', 'layer', 'catalog_name', 'database_name', 'table_name',
+                 's3_table_bucket_arn', 'config_bucket', 'aws_region']
+
+    # Get the layer argument first
+    layer_arg = getResolvedOptions(sys.argv, ['layer'])
+    layer = layer_arg['layer']
+
+    # Add layer-specific arguments
+    if layer == 'bronze':
+        base_args.append('raw_input_path')
+
+    if layer == 'silver':
+        base_args.append('pk_columns')
+
+
+    # Get all arguments
+    args = getResolvedOptions(sys.argv, base_args)
+
+    # Add optional arguments with defaults
+    args.setdefault('table_type', 'COW')
+    args.setdefault('compression', 'zstd')
+
+    return args
+
+
+def main():
+    """Main entry point for the Glue job"""
+    job = None
+    try:
+        # Get and validate job arguments
+        args = get_job_args()
+        validate_args(args)
+
+        # Initialize Spark with correct configuration
+        conf = SparkConf()
+
+        # Set Iceberg catalog configurations
+        catalog_name = args['catalog_name']
+        s3_table_bucket_arn = args['s3_table_bucket_arn']
+
+        # Configure Iceberg with S3Tables
+        conf.set(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog")
+        conf.set(f"spark.sql.catalog.{catalog_name}.catalog-impl", "software.amazon.s3tables.iceberg.S3TablesCatalog")
+        conf.set(f"spark.sql.catalog.{catalog_name}.warehouse", s3_table_bucket_arn)
+        conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+
+
+        # Initialize Spark context and session
+        spark_context = SparkContext(conf=conf)
+        glue_context = GlueContext(spark_context)
+        spark = glue_context.spark_session
+        job = Job(glue_context)
+        job.init(args['JOB_NAME'], args)
+
+
+        # Initialize and run processor
+        processor = IcebergTableProcessor(spark, args)
+        status = processor.process()
+
+        if status not in [0, 1]:
+            raise Exception("Processing failed")
+
+        logger.info("Job completed successfully")
+        if job:
+            job.commit()
+        return status
+
+    except Exception as e:
+        logger.error(f"Job failed: {str(e)}")
+        if job:
+            job.commit()
+        raise  # Re-raise the exception instead of sys.exit()
+
+
+if __name__ == "__main__":
+    main()
+
