@@ -1,0 +1,208 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "glue_job_config",
+  "States": {
+    "glue_job_config": {
+      "Type": "Pass",
+      "Next": "CheckNewRawFiles",
+      "Assign": {
+        "table_name": "{% $states.input.table_name %}",
+        "aws_region": "{% $states.input.aws_region %}",
+        "partition_cols": "{% $states.input.partition_cols %}",
+        "raw_input_path": "{% $states.input.raw_input_path %}",
+        "catalog_name": "{% $states.input.catalog_name %}",
+        "datalake_formats": "iceberg",
+        "s3_table_bucket_arn": "{% $states.input.s3_table_bucket_arn %}",
+        "pk_columns": "{% $states.input.pk_columns %}",
+        "extra_jars": "s3://s3-datalake-landing-bu1/jar/s3-tables-catalog-for-iceberg-runtime-0.1.5.jar",
+        "user_jars_first": "true",
+        "database_name": "{% $states.input.database_name %}",
+        "config_bucket": "{% $states.input.config_bucket %}",
+        "JOB_NAME": "{% $states.input.JOB_NAME %}"
+      }
+    },
+    "CheckNewRawFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Output": "{% $states.result.Payload %}",
+      "Arguments": {
+        "FunctionName": "arn:aws:lambda:us-east-1:263040894588:function:s3-file-checker:$LATEST",
+        "Payload": "{% $states.input %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "Choice"
+    },
+    "Choice": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "NoNewRecordToProcess",
+          "Condition": "{% ($states.input.result) = (0) %}"
+        }
+      ],
+      "Default": "GlueRawToBronzeJobRun"
+    },
+    "NoNewRecordToProcess": {
+      "Type": "Pass",
+      "End": true
+    },
+    "GlueRawToBronzeJobRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun",
+      "Arguments": {
+        "JobName": "{% $JOB_NAME %}",
+        "Arguments": {
+          "--table_name": "{% $table_name %}",
+          "--aws_region": "{% $aws_region %}",
+          "--partition_cols": "{% $partition_cols %}",
+          "--raw_input_path": "{% $raw_input_path %}",
+          "--catalog_name": "{% $catalog_name %}",
+          "--datalake-formats": "{% $datalake_formats%}",
+          "--s3_table_bucket_arn": "{% $s3_table_bucket_arn %}",
+          "--pk_columns": "{% $pk_columns %}",
+          "--extra-jars": "{% $extra_jars %}",
+          "--user-jars-first": "{% $user_jars_first %}",
+          "--layer": "bronze",
+          "--database_name": "{% $database_name %}",
+          "--config_bucket": "{% $config_bucket %}",
+          "--JOB_NAME": "{% $JOB_NAME %}"
+        }
+      },
+      "Next": "RawToBronzeJobWait"
+    },
+    "RawToBronzeJobWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetRawToBronzeJobRunStatus"
+    },
+    "GetRawToBronzeJobRunStatus": {
+      "Type": "Task",
+      "Arguments": {
+        "JobName": "{% $states.input.JobName %}",
+        "RunId": "{% $states.input.JobRunId %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "Next": "RawToBronzeJobStatus"
+    },
+    "RawToBronzeJobStatus": {
+      "Type": "Pass",
+      "Next": "CheckRawToBronzeStatus",
+      "Output": {
+        "status": "{% $states.input.JobRun.JobRunState %}",
+        "JobRunId": "{% $states.input.JobRun.Id %}",
+        "JobName": "{% $states.input.JobRun.JobName %}"
+      }
+    },
+    "CheckRawToBronzeStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "RawToBronzeJobSuccess",
+          "Condition": "{% ($states.input.status) = (\"SUCCEEDED\") %}"
+        },
+        {
+          "Next": "RawToBronzeJobWait",
+          "Condition": "{% ($states.input.status) = (\"RUNNING\") %}"
+        },
+        {
+          "Next": "RawToBronzeJobFailed",
+          "Condition": "{% ($states.input.status) = (\"FAILED\") %}"
+        }
+      ],
+      "Default": "RawToBronzeJobSuccess"
+    },
+    "RawToBronzeJobSuccess": {
+      "Type": "Pass",
+      "Next": "GlueBronzeToSilverJobRun"
+    },
+    "GlueBronzeToSilverJobRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun",
+      "Arguments": {
+        "JobName": "{% $JOB_NAME %}",
+        "Arguments": {
+          "--table_name": "{% $table_name %}",
+          "--aws_region": "{% $aws_region %}",
+          "--partition_cols": "{% $partition_cols %}",
+          "--raw_input_path": "{% $raw_input_path %}",
+          "--catalog_name": "{% $catalog_name %}",
+          "--datalake-formats": "{% $datalake_formats%}",
+          "--s3_table_bucket_arn": "{% $s3_table_bucket_arn %}",
+          "--pk_columns": "{% $pk_columns %}",
+          "--extra-jars": "{% $extra_jars %}",
+          "--user-jars-first": "{% $user_jars_first %}",
+          "--layer": "silver",
+          "--database_name": "{% $database_name %}",
+          "--config_bucket": "{% $config_bucket %}",
+          "--JOB_NAME": "{% $JOB_NAME %}"
+        }
+      },
+      "Next": "BronzeToSilverJobWait"
+    },
+    "BronzeToSilverJobWait": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetBronzeToSilverJobRunStatus"
+    },
+    "GetBronzeToSilverJobRunStatus": {
+      "Type": "Task",
+      "Arguments": {
+        "JobName": "{% $states.input.JobName %}",
+        "RunId": "{% $states.input.JobRunId %}"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "Next": "BronzeToSilverJobStatus"
+    },
+    "BronzeToSilverJobStatus": {
+      "Type": "Pass",
+      "Output": {
+        "status": "{% $states.input.JobRun.JobRunState %}",
+        "JobRunId": "{% $states.input.JobRun.Id %}",
+        "JobName": "{% $states.input.JobRun.JobName %}"
+      },
+      "Next": "CheckBronzeToSilverStatus"
+    },
+    "CheckBronzeToSilverStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Next": "BronzeToSilverSuccess",
+          "Condition": "{% ($states.input.status) = (\"SUCCEEDED\") %}"
+        },
+        {
+          "Next": "BronzeToSilverJobWait",
+          "Condition": "{% ($states.input.status) = (\"RUNNING\") %}"
+        },
+        {
+          "Next": "BronzeToSilverJobFailed",
+          "Condition": "{% ($states.input.status) = (\"FAILED\") %}"
+        }
+      ],
+      "Default": "BronzeToSilverSuccess"
+    },
+    "BronzeToSilverSuccess": {
+      "Type": "Pass",
+      "End": true
+    },
+    "RawToBronzeJobFailed": {
+      "Type": "Fail"
+    },
+    "BronzeToSilverJobFailed": {
+      "Type": "Fail"
+    }
+  },
+  "QueryLanguage": "JSONata"
+}
