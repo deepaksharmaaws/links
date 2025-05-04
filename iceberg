@@ -473,7 +473,7 @@ class IcebergTableProcessor:
 
 
 
-    def process(self) -> int:
+    def process(self) -> bool:
         """Main processing method"""
         try:
             # Get new data
@@ -482,21 +482,12 @@ class IcebergTableProcessor:
             if df is not None and snapshot_id is not None:
                 # Transform data
                 transformed_df = self.transform_data(df)
-                record_count = df.count()
-                logger.info(f"Retrieved {record_count} records to process")
+
                 # Write data
                 success = self.write_data(transformed_df, snapshot_id)
-                if success:
-                    logger.info("Records processed successfully")
-                    return 1
-                else:
-                    logger.info(" Processing Failed")
-                    return -1
-                #return success
+                return success
 
-            else:
-                logger.info("No new data to process")
-                return 0
+            return True
 
         except Exception as e:
             logger.error(f"Error in processessing: {str(e)}")
@@ -551,7 +542,6 @@ def get_job_args() -> Dict[str, str]:
 
 def main():
     """Main entry point for the Glue job"""
-    job = None
     try:
         # Get and validate job arguments
         args = get_job_args()
@@ -581,23 +571,20 @@ def main():
 
         # Initialize and run processor
         processor = IcebergTableProcessor(spark, args)
-        status = processor.process()
+        success = processor.process()
 
-        if status not in [0, 1]:
+        if not success:
             raise Exception("Processing failed")
 
         logger.info("Job completed successfully")
-        if job:
-            job.commit()
-        return status
 
     except Exception as e:
         logger.error(f"Job failed: {str(e)}")
-        if job:
-            job.commit()
-        raise  # Re-raise the exception instead of sys.exit()
+        raise
+    finally:
+        job.commit()
+
 
 
 if __name__ == "__main__":
     main()
-
