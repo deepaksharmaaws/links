@@ -1,0 +1,104 @@
+import json
+import boto3
+from urllib.parse import urlparse
+from datetime import datetime
+import logging
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+class S3ConfigManager:
+    def __init__(self, bucket: str, region: str):
+        """Initialize S3 Config Manager"""
+        self.bucket = bucket
+        self.s3_client = boto3.client('s3', region_name=region)
+
+    def load_checkpoint(self, layer: str, table_name: str) -> Optional[Dict[str, Any]]:
+        """Load checkpoint from S3"""
+        try:
+            checkpoint_path = f"checkpoints/{layer}/{table_name}_checkpoint.json"
+            try:
+                response = self.s3_client.get_object(
+                    Bucket=self.bucket,
+                    Key=checkpoint_path
+                )
+                checkpoint = json.loads(response['Body'].read().decode('utf-8'))
+                return checkpoint
+            except self.s3_client.exceptions.NoSuchKey:
+                logger.info(f"No checkpoint found for {table_name}")
+                return None
+        except Exception as e:
+            logger.error(f"Error loading checkpoint: {str(e)}")
+            raise
+
+    def _parse_s3_path(self, s3_path: str):
+        """Parse S3 path into bucket and key"""
+        parsed = urlparse(s3_path)
+        return parsed.netloc, parsed.path.lstrip('/')
+
+    def list_s3_files(self, prefix: str, last_checkpoint_time: str = None):
+        """List S3 files in the specified prefix"""
+        try:
+            files = []
+            bucket, prefix = self._parse_s3_path(prefix)
+            logger.info(f"parse_s3_path: {bucket}, {prefix}")
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+
+            # Convert checkpoint time to datetime if provided
+            checkpoint_dt = None
+            if last_checkpoint_time:
+                try:
+                    checkpoint_dt = datetime.fromisoformat(last_checkpoint_time).replace(tzinfo=None)
+                    logger.info(f"checkpoint_dt: {checkpoint_dt}")
+                except ValueError:
+                    logger.warning(f"Invalid checkpoint time format: {last_checkpoint_time}")
+
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    last_modified = obj['LastModified'].replace(tzinfo=None)
+                    logger.info(f"last_modified: {last_modified}")
+                    if not checkpoint_dt or last_modified > checkpoint_dt:
+                        files.append(f"s3://{bucket}/{obj['Key']}")
+
+            logger.info(f"Found {len(files)} new files to process")
+            return files
+        except Exception as e:
+            logger.error(f"Error listing S3 files: {str(e)}")
+            raise
+
+
+def lambda_handler(event, context):
+    # Extract parameters from the event
+    bucket = event['config_bucket']
+    region = event['aws_region']
+    raw_input_path = event['raw_input_path']
+    layer = event['layer']
+    table_name = event['table_name']
+
+    # Initialize S3ConfigManager
+    s3_config = S3ConfigManager(bucket, region)
+
+    try:
+        # Get last checkpoint
+        checkpoint = s3_config.load_checkpoint(layer, table_name)
+        last_checkpoint_time = checkpoint.get('last_processed_snapshot') if checkpoint else None
+        logger.info(f"last_checkpoint_time: {last_checkpoint_time}")
+
+        # List S3 files
+        new_files = s3_config.list_s3_files(raw_input_path, last_checkpoint_time)
+
+        # Determine the result
+        result = 1 if new_files else 0
+
+        return {"result": result}
+
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
+        }
