@@ -1,0 +1,29 @@
+# For database-level tags
+database:
+  name: silver_events_database
+  tags:
+    layer: silver
+    
+
+# For table-level and column-level tags
+table:  
+  name: mobile_event_router_v1_mobile_app_lifecycle_changed
+  tags:
+    domain: growth
+    visibility: private
+  columns:
+    - name: column1
+      tags:
+        datasensitivity: public
+        dataelement: id
+    - name: column2
+      tags:
+        datasensitivity: restricted
+        dataelement: name
+    - name: column2
+      tags:
+        datasensitivity: confidential
+        
+
+
+
