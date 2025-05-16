@@ -1,0 +1,37 @@
+database:
+  name: growthdb
+  tags:
+    lf_layer: silver
+  tables:
+    - name: customer
+      tags:
+        lf_domain: risk
+        lf_visibility: private
+      columns:
+        - name: customer_id1
+          tags:
+            lf_data_sensitivity: public
+            lf_data_element: id
+        - name: customer_fname1
+          tags:
+            lf_data_sensitivity: confidential
+            lf_data_element: name
+        - name: ssn
+          tags:
+            lf_data_sensitivity: restricted
+
+    - name: orders
+      tags:
+        lf_domain: growth
+        lf_visibility: public
+      columns:
+        - name: order_id
+          tags:
+            lf_data_sensitivity: confidential
+            lf_data_element: id
+        - name: total_amount
+          tags:
+            lf_data_sensitivity: confidential
+            lf_data_element: amount
+
+
