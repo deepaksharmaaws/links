@@ -693,13 +693,31 @@ def lambda_handler(event, context):
         dict: Response with detailed processing summary
     """
     try:
-        # Validate event structure
         if 'Records' not in event:
-            raise ValueError("Invalid event: Not an S3 event trigger")
+            raise ValueError("Invalid event: Not an SNS event")
 
-        record = event['Records'][0]
-        if 's3' not in record:
-            raise ValueError("Invalid event: Missing S3 information")
+        # Get the SNS record
+        sns_record = event['Records'][0]
+        if 'Sns' not in sns_record:
+            raise ValueError("Invalid event: Missing SNS information")
+
+        # Parse the S3 event from the SNS message
+        sns_message = json.loads(sns_record['Sns']['Message'])
+
+        # Validate S3 event in SNS message
+        if 'Records' not in sns_message:
+            raise ValueError("Invalid SNS message: Not an S3 event")
+
+        # Get the S3 record from SNS message
+        s3_record = sns_message['Records'][0]
+        if 's3' not in s3_record:
+            raise ValueError("Invalid SNS message: Missing S3 information")
+
+        # Extract S3 bucket and key information
+        bucket = s3_record['s3']['bucket']['name']
+        key = s3_record['s3']['object']['key']
+
+        logger.info(f"Processing file: s3://{bucket}/{key}")
 
         # Get admin role ARN from environment variables
         admin_role_arn = os.environ.get('LF_ADMIN_ROLE_ARN')
@@ -707,11 +725,6 @@ def lambda_handler(event, context):
             raise ValueError("Missing required environment variable: LF_ADMIN_ROLE_ARN")
 
         logger.info(f"Using Lake Formation Admin Role: {admin_role_arn}")
-
-        # Extract S3 information
-        bucket = record['s3']['bucket']['name']
-        key = urllib.parse.unquote_plus(record['s3']['object']['key'])
-        logger.info(f"Processing file: s3://{bucket}/{key}")
 
         lf_manager = LFTagManager(admin_role_arn)
 
