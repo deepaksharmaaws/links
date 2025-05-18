@@ -389,7 +389,7 @@ class LakeFormationPermissions:
             current_permissions (Dict): Current permissions from Lake Formation
 
         Returns:
-            Dict: Changes required (grant_permissions, revoke_permissions, no_changes)
+            Dict: Changes required (grant_permissions, revoke_permissions, no_change_permissions)
         """
         try:
             grant_permissions = []
@@ -402,16 +402,36 @@ class LakeFormationPermissions:
                 current = current_permissions.get(principal_arn, {})
                 logger.info(f"Comparing permissions for principal: {principal_arn}")
 
-                if not current:
-                    logger.info(f"No current permissions found for {principal_arn}, adding to grants")
-                    self._add_to_grant_list(grant_permissions, proposed)
-                    continue
-
                 # Compare permissions for each resource type
                 for resource_type in ['DATABASE', 'TABLE']:
-                    proposed_resource = proposed.get(resource_type, {})
+                    # Get current permissions for this resource type
                     current_resource = current.get(resource_type, {})
 
+                    # Check if proposed configuration is empty list (revoke all)
+                    if proposed.get(resource_type) == []:
+                        logger.info(
+                            f"Empty {resource_type} configuration for {principal_arn} - will revoke all permissions")
+                        if current_resource:
+                            # Add current permissions to revoke list
+                            revoke_permissions.append({
+                                'Principal': {
+                                    'DataLakePrincipalIdentifier': principal_arn
+                                },
+                                'Resource': {
+                                    'LFTagPolicy': {
+                                        'CatalogId': self.catalog_id,
+                                        'ResourceType': resource_type,
+                                        'Expression': current_resource['tag_expressions']
+                                    }
+                                },
+                                'Permissions': current_resource['permissions']
+                            })
+                        continue
+
+                    # Get proposed resource configuration
+                    proposed_resource = proposed.get(resource_type, {})
+
+                    # Skip if no proposed permissions for this resource type
                     if not proposed_resource:
                         logger.debug(f"No {resource_type} permissions proposed for {principal_arn}")
                         continue
@@ -440,27 +460,53 @@ class LakeFormationPermissions:
                             f"Proposed tags: {proposed_tags}"
                         )
 
+                        # If there are current permissions, add to revoke list
                         if current_resource:
-                            self._add_specific_revoke(
-                                revoke_permissions,
-                                principal_arn,
-                                resource_type,
-                                current_resource
-                            )
-                        self._add_specific_grant(
-                            grant_permissions,
-                            principal_arn,
-                            resource_type,
-                            proposed_resource
-                        )
+                            revoke_permissions.append({
+                                'Principal': {
+                                    'DataLakePrincipalIdentifier': principal_arn
+                                },
+                                'Resource': {
+                                    'LFTagPolicy': {
+                                        'CatalogId': self.catalog_id,
+                                        'ResourceType': resource_type,
+                                        'Expression': current_resource['tag_expressions']
+                                    }
+                                },
+                                'Permissions': current_resource['permissions']
+                            })
+
+                        # If there are proposed permissions, add to grant list
+                        if proposed_resource.get('tag_expressions'):
+                            grant_permissions.append({
+                                'Principal': {
+                                    'DataLakePrincipalIdentifier': principal_arn
+                                },
+                                'Resource': {
+                                    'LFTagPolicy': {
+                                        'CatalogId': self.catalog_id,
+                                        'ResourceType': resource_type,
+                                        'Expression': proposed_resource['tag_expressions']
+                                    }
+                                },
+                                'Permissions': proposed_resource['permissions']
+                            })
                     else:
                         logger.info(f"No changes needed for {principal_arn} {resource_type}")
-                        self._add_to_no_change_list(
-                            no_change_permissions,
-                            principal_arn,
-                            resource_type,
-                            current_resource
-                        )
+                        if current_resource:
+                            no_change_permissions.append({
+                                'Principal': {
+                                    'DataLakePrincipalIdentifier': principal_arn
+                                },
+                                'Resource': {
+                                    'LFTagPolicy': {
+                                        'CatalogId': self.catalog_id,
+                                        'ResourceType': resource_type,
+                                        'Expression': current_resource['tag_expressions']
+                                    }
+                                },
+                                'Permissions': current_resource['permissions']
+                            })
 
             return {
                 'grant_permissions': grant_permissions,
@@ -619,96 +665,6 @@ class LakeFormationPermissions:
             logger.error(f"Error normalizing tag expressions: {str(e)}")
             raise PermissionError(f"Failed to normalize tag expressions: {str(e)}")
 
-
-    def _add_specific_grant(self, grant_list: List[Dict], principal_arn: str,
-                            resource_type: str, resource_config: Dict) -> None:
-        """
-        Add specific resource type permissions to grant list
-
-        Args:
-            grant_list (List[Dict]): List to add grants to
-            principal_arn (str): Principal ARN
-            resource_type (str): Resource type
-            resource_config (Dict): Resource configuration
-        """
-        try:
-            if resource_config.get('tag_expressions') and resource_config.get('permissions'):
-                grant_list.append({
-                    'Principal': {
-                        'DataLakePrincipalIdentifier': principal_arn
-                    },
-                    'Resource': {
-                        'LFTagPolicy': {
-                            'CatalogId': self.catalog_id,
-                            'ResourceType': resource_type,
-                            'Expression': resource_config['tag_expressions']
-                        }
-                    },
-                    'Permissions': resource_config['permissions']
-                })
-        except Exception as e:
-            logger.error(f"Error adding grant permission: {str(e)}")
-            raise PermissionError(f"Failed to add grant permission: {str(e)}")
-
-    def _add_specific_revoke(self, revoke_list: List[Dict], principal_arn: str,
-                             resource_type: str, resource_config: Dict) -> None:
-        """
-        Add specific resource type permissions to revoke list
-
-        Args:
-            revoke_list (List[Dict]): List to add revokes to
-            principal_arn (str): Principal ARN
-            resource_type (str): Resource type
-            resource_config (Dict): Resource configuration
-        """
-        try:
-            if resource_config.get('tag_expressions'):
-                revoke_list.append({
-                    'Principal': {
-                        'DataLakePrincipalIdentifier': principal_arn
-                    },
-                    'Resource': {
-                        'LFTagPolicy': {
-                            'CatalogId': self.catalog_id,
-                            'ResourceType': resource_type,
-                            'Expression': resource_config['tag_expressions']
-                        }
-                    },
-                    'Permissions': resource_config['permissions']
-                })
-        except Exception as e:
-            logger.error(f"Error adding revoke permission: {str(e)}")
-            raise PermissionError(f"Failed to add revoke permission: {str(e)}")
-
-    def _add_to_no_change_list(self, no_change_list: List[Dict], principal_arn: str,
-                               resource_type: str, resource_config: Dict) -> None:
-        """
-        Add permissions that don't need changes to no_change list
-
-        Args:
-            no_change_list (List[Dict]): List to add unchanged permissions to
-            principal_arn (str): Principal ARN
-            resource_type (str): Resource type
-            resource_config (Dict): Resource configuration
-        """
-        try:
-            if resource_config:
-                no_change_list.append({
-                    'Principal': {
-                        'DataLakePrincipalIdentifier': principal_arn
-                    },
-                    'Resource': {
-                        'LFTagPolicy': {
-                            'CatalogId': self.catalog_id,
-                            'ResourceType': resource_type,
-                            'Expression': resource_config.get('tag_expressions', [])
-                        }
-                    },
-                    'Permissions': resource_config.get('permissions', [])
-                })
-        except Exception as e:
-            logger.error(f"Error adding no-change permission: {str(e)}")
-            raise PermissionError(f"Failed to add no-change permission: {str(e)}")
 
     def load_current_permissions(self) -> None:
         """Load current Lake Formation permissions"""
@@ -1153,14 +1109,31 @@ def lambda_handler(event, context):
     """
     try:
         if 'Records' not in event:
-            raise ValueError("Not an S3 event trigger")
+            raise ValueError("Invalid event: Not an SNS event")
 
-        record = event['Records'][0]
-        if 's3' not in record:
-            raise ValueError("Not an S3 event")
+        # Get the SNS record
+        sns_record = event['Records'][0]
+        if 'Sns' not in sns_record:
+            raise ValueError("Invalid event: Missing SNS information")
 
-        bucket = record['s3']['bucket']['name']
-        key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+        # Parse the S3 event from the SNS message
+        sns_message = json.loads(sns_record['Sns']['Message'])
+
+        # Validate S3 event in SNS message
+        if 'Records' not in sns_message:
+            raise ValueError("Invalid SNS message: Not an S3 event")
+
+        # Get the S3 record from SNS message
+        s3_record = sns_message['Records'][0]
+        if 's3' not in s3_record:
+            raise ValueError("Invalid SNS message: Missing S3 information")
+
+        # Extract S3 bucket and key information
+        bucket = s3_record['s3']['bucket']['name']
+        key = s3_record['s3']['object']['key']
+
+        logger.info(f"Processing file: s3://{bucket}/{key}")
+
 
         admin_role_arn = os.environ.get('ADMIN_ROLE_ARN')
         if not admin_role_arn:
