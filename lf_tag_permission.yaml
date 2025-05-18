@@ -1,0 +1,28 @@
+permissions:
+  - principal:
+      arn: "arn:aws:iam::263040894588:role/data-analyst-growth"
+      DATABASE:
+        - tags:
+            lf_domain:
+              - growth
+            lf_data_sensitivity:
+              - public
+          permissions:
+            - DESCRIBE
+      TABLE:
+        - tags:
+            lf_domain:
+              - growth
+            lf_data_sensitivity:
+              - public
+          permissions:
+            - DESCRIBE
+            - SELECT
+
+
+  - principal:
+      arn: "arn:aws:iam::263040894588:role/data-owner-growth"
+      DATABASE: []
+      TABLE: []
+
+
