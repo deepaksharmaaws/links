@@ -1,0 +1,9 @@
+{
+  "Records": [
+    {
+      "Sns": {
+        "Message": "{\"Records\":[{\"s3\":{\"bucket\":{\"name\":\"lf-config-263040894588\"},\"object\":{\"key\":\"config/db1/tbl1/lf_tag_permission.yaml\"}}}]}"
+      }
+    }
+  ]
+}
