@@ -1,0 +1,182 @@
+Valid Configuration Examples:
+# 1. Basic Database Tags
+database:
+  name: growthdb
+  tags:
+    lf_domain: growth
+    lf_data_sensitivity: public
+
+
+# 2. Database with Table Tags
+database:
+  name: riskdb
+  tags:
+    lf_domain: risk
+    lf_data_sensitivity: confidential
+  tables:
+    - name: customer_risk
+      tags:
+        lf_domain: risk
+        lf_data_sensitivity: restricted
+
+# 3. Complete Configuration with Tables and Columns
+database:
+  name: analyticsdb
+  tags:
+    lf_domain: analytics
+    lf_data_sensitivity: public
+  tables:
+    - name: customer_metrics
+      tags:
+        lf_domain: analytics
+        lf_data_sensitivity: confidential
+      columns:
+        - name: customer_id
+          tags:
+            lf_data_sensitivity: public
+        - name: email
+          tags:
+            lf_data_sensitivity: restricted
+
+# 1. Missing Database Name
+database:
+  tags:
+    lf_domain: growth
+
+# Expected Error: "Database must have a 'name' field of type string"
+
+# 2. Invalid Tag Value
+database:
+  name: growthdb
+  tags:
+    lf_domain: invalid_domain  # Invalid value not in allowed list
+    lf_data_sensitivity: public
+
+# Expected Error: "Tag value 'invalid_domain' is not allowed for key 'lf_domain'"
+
+# 3. Invalid Tag Key
+database:
+  name: growthdb
+  tags:
+    invalid_tag: value  # Key doesn't exist in LF tags
+    lf_data_sensitivity: public
+
+# Expected Error: "Tag key 'invalid_tag' does not exist"
+
+# 4. Invalid Table Structure
+database:
+  name: growthdb
+  tables:
+    - tags:  # Missing table name
+        lf_domain: growth
+
+# Expected Error: "Each table must have a 'name' field of type string"
+
+# 5. Invalid Column Structure
+database:
+  name: growthdb
+  tables:
+    - name: customer
+      columns:
+        - tags:  # Missing column name
+            lf_data_sensitivity: public
+
+# Expected Error: "Column must have a 'name' field of type string"
+
+# 6. Duplicate Column Names
+database:
+  name: growthdb
+  tables:
+    - name: customer
+      columns:
+        - name: customer_id
+          tags:
+            lf_data_sensitivity: public
+        - name: customer_id  # Duplicate column name
+          tags:
+            lf_data_sensitivity: confidential
+
+# Expected Error: "Duplicate column name: customer_id"
+
+# non_existent_database.yaml
+database:
+  name: nonexistentdb  # Database doesn't exist in Glue Catalog
+  tags:
+    lf_domain: growth
+    lf_data_sensitivity: public
+
+
+{
+    "statusCode": 400,
+    "body": {
+        "error": "Resource Validation Error",
+        "details": {
+            "message": "Resource validation failed",
+            "validation_errors": [
+                "Database 'nonexistentdb' does not exist in Glue Catalog"
+            ]
+        }
+    }
+}
+
+ #non_existent_tables.yaml
+database:
+  name: growthdb  # Existing database
+  tags:
+    lf_domain: growth
+  tables:
+    - name: fake_table1  # Table doesn't exist
+      tags:
+        lf_domain: growth
+        lf_data_sensitivity: public
+    - name: fake_table2  # Table doesn't exist
+      tags:
+        lf_domain: growth
+        lf_data_sensitivity: confidential
+
+{
+    "statusCode": 400,
+    "body": {
+        "error": "Resource Validation Error",
+        "details": {
+            "message": "Resource validation failed",
+            "validation_errors": [
+                "Table 'growthdb.fake_table1' does not exist in Glue Catalog",
+                "Table 'growthdb.fake_table2' does not exist in Glue Catalog"
+            ]
+        }
+    }
+}
+
+
+# non_existent_columns.yaml
+database:
+  name: growthdb
+  tables:
+    - name: customer  # Existing table
+      columns:
+        - name: nonexistent_column1  # Column doesn't exist
+          tags:
+            lf_data_sensitivity: public
+        - name: nonexistent_column2  # Column doesn't exist
+          tags:
+            lf_data_sensitivity: confidential
+
+   {
+    "statusCode": 400,
+    "body": {
+        "error": "Resource Validation Error",
+        "details": {
+            "message": "Resource validation failed",
+            "validation_errors": [
+                "Column 'nonexistent_column1' does not exist in table 'growthdb.customer'",
+                "Column 'nonexistent_column2' does not exist in table 'growthdb.customer'"
+            ]
+        }
+    }
+}
+
+
+
+
+
