@@ -1,0 +1,93 @@
+1. To Keep TABLE Permissions Unchanged (NO CHANGES):
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/analyst"
+      DATABASE:  # Only specify changes for DATABASE
+        - tags:
+            lf_domain: ["analytics", "marketing"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+      # TABLE section is omitted completely - means no changes to TABLE permissions
+
+# Update DATABASE permissions, revoke TABLE permissions
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/analyst"
+      DATABASE:
+        - tags:
+            lf_domain: ["analytics", "marketing"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+      TABLE: []  # Empty list means REVOKE all TABLE permissions
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/analyst"
+      # DATABASE section omitted - means NO CHANGES to DATABASE permissions
+      TABLE: []    # Empty list means REVOKE ALL TABLE permissions
+
+
+
+# Valid Basic Configuration
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/analyst"
+      DATABASE:
+        - tags:
+            lf_domain: ["analytics"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+      TABLE:
+        - tags:
+            lf_domain: ["analytics"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["SELECT", "DESCRIBE"]
+
+# Invalid - Missing permissions root
+invalid_root:
+  - principal: {}
+
+# Invalid - permissions not a list
+permissions:
+  principal: {}
+
+# Invalid ARN Format
+permissions:
+  - principal:
+      arn: "invalid:arn:format"
+      DATABASE: []
+      TABLE: []
+
+
+# Duplicate ARN with Different Permissions
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/data-analyst"
+      DATABASE:
+        - tags:
+            lf_domain: ["analytics"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+      TABLE:
+        - tags:
+            lf_domain: ["analytics"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["SELECT"]
+
+  - principal:  # Duplicate with different permissions
+      arn: "arn:aws:iam::123456789012:role/data-analyst"
+      DATABASE:
+        - tags:
+            lf_domain: ["analytics"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["CREATE_TABLE"]
+      TABLE:
+        - tags:
+            lf_domain: ["analytics"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["INSERT", "DELETE"]
+
+# Expected Error: "Conflicting permissions found for duplicate ARN: arn:aws:iam::123456789012:role/data-analyst"
+
