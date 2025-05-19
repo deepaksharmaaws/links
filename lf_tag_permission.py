@@ -149,42 +149,53 @@ class ConfigValidator:
     @staticmethod
     def validate_principal_structure(principal: Dict) -> None:
         """
-        Validate the structure of a principal.
-        DATABASE and TABLE can be empty lists for permission revocation.
+        Validate the structure of a principal with the following rules:
+        1. If both DATABASE and TABLE are present, they can be empty lists (for revoking all permissions)
+        2. Either DATABASE or TABLE can be omitted
+        3. If present and not empty, each section must have valid configurations
         """
         try:
             if not isinstance(principal, dict):
                 raise ValidationError("Principal must be a dictionary")
 
-            required_fields = {'arn', 'DATABASE', 'TABLE'}
-            missing_fields = required_fields - set(principal.keys())
-            if missing_fields:
-                raise ValidationError(f"Missing required fields in principal: {missing_fields}")
+            # Check for required ARN field
+            if 'arn' not in principal:
+                raise ValidationError("Missing required field 'arn' in principal")
 
             if not isinstance(principal['arn'], str):
                 raise ValidationError("ARN must be a string")
             if not principal['arn'].startswith('arn:aws:iam::'):
                 raise ValidationError("Invalid ARN format")
 
-            # Validate DATABASE configuration
-            if not isinstance(principal['DATABASE'], list):
-                raise ValidationError("DATABASE must be a list")
-            for db in principal['DATABASE']:
-                if db:  # Only validate if not empty
-                    ConfigValidator.validate_resource_structure(db, 'DATABASE')
+            # Check if DATABASE and/or TABLE sections are present
+            database_present = 'DATABASE' in principal
+            table_present = 'TABLE' in principal
 
-            # Validate TABLE configuration
-            if not isinstance(principal['TABLE'], list):
-                raise ValidationError("TABLE must be a list")
-            for table in principal['TABLE']:
-                if table:  # Only validate if not empty
-                    ConfigValidator.validate_resource_structure(table, 'TABLE')
+            # At least one section must be present
+            if not database_present and not table_present:
+                raise ValidationError("At least one of DATABASE or TABLE sections must be present")
+
+            # Validate DATABASE if present
+            if database_present:
+                if not isinstance(principal['DATABASE'], list):
+                    raise ValidationError("DATABASE must be a list")
+                for db in principal['DATABASE']:
+                    if db:  # Only validate if not empty
+                        ConfigValidator.validate_resource_structure(db, 'DATABASE')
+
+            # Validate TABLE if present
+            if table_present:
+                if not isinstance(principal['TABLE'], list):
+                    raise ValidationError("TABLE must be a list")
+                for table in principal['TABLE']:
+                    if table:  # Only validate if not empty
+                        ConfigValidator.validate_resource_structure(table, 'TABLE')
+
+            # Both sections can be empty lists, which is valid for revoking all permissions
 
         except Exception as e:
             logger.error(f"Error validating principal structure: {str(e)}")
             raise
-
-
 
     @staticmethod
     def check_duplicate_principals(config: Dict) -> None:
@@ -313,7 +324,9 @@ class PermissionsValidator:
     @staticmethod
     def validate_config_permissions(config: Dict) -> None:
         """
-        Validate permissions in the configuration
+        Validate permissions in the configuration.
+        DATABASE and TABLE sections are optional, but if present and not empty,
+        their permissions must be valid.
 
         Args:
             config (Dict): Configuration to validate
@@ -324,10 +337,19 @@ class PermissionsValidator:
         try:
             for permission in config['permissions']:
                 principal = permission['principal']
-                for db in principal['DATABASE']:
-                    PermissionsValidator.validate_database_permissions(db['permissions'])
-                for table in principal['TABLE']:
-                    PermissionsValidator.validate_table_permissions(table['permissions'])
+
+                # Validate DATABASE permissions if present and not empty
+                if 'DATABASE' in principal:
+                    for db in principal['DATABASE']:
+                        if db and 'permissions' in db:  # Only validate if not empty and has permissions
+                            PermissionsValidator.validate_database_permissions(db['permissions'])
+
+                # Validate TABLE permissions if present and not empty
+                if 'TABLE' in principal:
+                    for table in principal['TABLE']:
+                        if table and 'permissions' in table:  # Only validate if not empty and has permissions
+                            PermissionsValidator.validate_table_permissions(table['permissions'])
+
         except Exception as e:
             logger.error(f"Error validating config permissions: {str(e)}")
             raise
@@ -827,7 +849,9 @@ class LFTagValidator:
 
     def validate_config_tags(self, config: Dict) -> None:
         """
-        Validate all tags in the configuration
+        Validate all tags in the configuration.
+        DATABASE and TABLE sections are optional, but if present and not empty,
+        their tags must be valid.
 
         Args:
             config (Dict): Configuration to validate
@@ -840,20 +864,28 @@ class LFTagValidator:
             for permission in config['permissions']:
                 principal = permission['principal']
 
-                # Validate DATABASE tags
-                logger.debug(f"Validating DATABASE tags for principal: {principal.get('arn')}")
-                for db in principal['DATABASE']:
-                    self.validate_resource_tags(db['tags'])
+                # Validate DATABASE tags if present and not empty
+                if 'DATABASE' in principal:
+                    logger.debug(f"Validating DATABASE tags for principal: {principal.get('arn')}")
+                    for db in principal['DATABASE']:
+                        if db and 'tags' in db:  # Only validate if not empty and has tags
+                            self.validate_resource_tags(db['tags'])
 
-                # Validate TABLE tags
-                logger.debug(f"Validating TABLE tags for principal: {principal.get('arn')}")
-                for table in principal['TABLE']:
-                    self.validate_resource_tags(table['tags'])
+                # Validate TABLE tags if present and not empty
+                if 'TABLE' in principal:
+                    logger.debug(f"Validating TABLE tags for principal: {principal.get('arn')}")
+                    for table in principal['TABLE']:
+                        if table and 'tags' in table:  # Only validate if not empty and has tags
+                            self.validate_resource_tags(table['tags'])
 
             logger.info("Successfully validated all configuration tags")
 
         except ValidationError:
             raise
+        except KeyError as e:
+            error_msg = f"Missing required field in configuration: {str(e)}"
+            logger.error(error_msg)
+            raise ValidationError(error_msg)
         except Exception as e:
             error_msg = f"Error validating configuration tags: {str(e)}"
             logger.error(error_msg)
@@ -946,34 +978,36 @@ class PermissionsManager:
             for permission in config['permissions']:
                 principal = permission['principal']
                 principal_info = {
-                    'principal_arn': principal['arn'],
-                    'DATABASE': {
-                        'tag_expressions': [],
-                        'permissions': []
-                    },
-                    'TABLE': {
-                        'tag_expressions': [],
-                        'permissions': []
-                    }
+                    'principal_arn': principal['arn']
                 }
 
-                # Format DATABASE permissions and tags
-                for db in principal.get('DATABASE', []):
-                    tag_expressions = [
-                        {'TagKey': key, 'TagValues': values}
-                        for key, values in db['tags'].items()
-                    ]
-                    principal_info['DATABASE']['tag_expressions'].extend(tag_expressions)
-                    principal_info['DATABASE']['permissions'] = db['permissions']
+                # Format DATABASE permissions and tags if present
+                if 'DATABASE' in principal:
+                    principal_info['DATABASE'] = []  # Empty list means revoke all
+                    for db in principal.get('DATABASE', []):
+                        if db:  # If not empty (i.e., not just revoking)
+                            tag_expressions = [
+                                {'TagKey': key, 'TagValues': values}
+                                for key, values in db['tags'].items()
+                            ]
+                            principal_info['DATABASE'] = {
+                                'tag_expressions': tag_expressions,
+                                'permissions': db['permissions']
+                            }
 
-                # Format TABLE permissions and tags
-                for table in principal.get('TABLE', []):
-                    tag_expressions = [
-                        {'TagKey': key, 'TagValues': values}
-                        for key, values in table['tags'].items()
-                    ]
-                    principal_info['TABLE']['tag_expressions'].extend(tag_expressions)
-                    principal_info['TABLE']['permissions'] = table['permissions']
+                # Format TABLE permissions and tags if present
+                if 'TABLE' in principal:
+                    principal_info['TABLE'] = []  # Empty list means revoke all
+                    for table in principal.get('TABLE', []):
+                        if table:  # If not empty (i.e., not just revoking)
+                            tag_expressions = [
+                                {'TagKey': key, 'TagValues': values}
+                                for key, values in table['tags'].items()
+                            ]
+                            principal_info['TABLE'] = {
+                                'tag_expressions': tag_expressions,
+                                'permissions': table['permissions']
+                            }
 
                 formatted_permissions.append(principal_info)
 
