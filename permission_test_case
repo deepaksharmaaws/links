@@ -91,3 +91,209 @@ permissions:
 
 # Expected Error: "Conflicting permissions found for duplicate ARN: arn:aws:iam::123456789012:role/data-analyst"
 
+=============
+Successful Scenarios:
+
+Only DATABASE permissions:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+
+Only TABLE permissions:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      TABLE:
+        - tags:
+            lf_domain: ["risk"]
+            lf_data_sensitivity: ["confidential"]
+          permissions: ["SELECT", "DESCRIBE"]
+
+
+Both DATABASE and TABLE permissions:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+      TABLE:
+        - tags:
+            lf_domain: ["risk"]
+            lf_data_sensitivity: ["confidential"]
+          permissions: ["SELECT"]
+
+
+Revoke all permissions:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE: []
+      TABLE: []
+
+
+Revoke only DATABASE permissions:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE: []
+
+Multiple tag values:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk", "finance"]
+            lf_data_sensitivity: ["public"]
+          permissions: ["DESCRIBE"]
+
+Failed Scenarios:
+
+Missing ARN:
+permissions:
+  - principal:
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: ["DESCRIBE"]
+
+Error: "Missing required field 'arn' in principal"
+
+Invalid ARN format:
+
+permissions:
+  - principal:
+      arn: "invalid-arn"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: ["DESCRIBE"]
+
+Error: "Invalid ARN format"
+
+Missing tags:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - permissions: ["DESCRIBE"]
+
+Error: "Missing required fields in DATABASE: {'tags'}"
+
+Invalid tag key:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            invalid_tag: ["value"]
+          permissions: ["DESCRIBE"]
+
+Error: "Invalid LakeFormation tag keys: {'invalid_tag'}"
+
+Invalid tag value:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["invalid_value"]
+          permissions: ["DESCRIBE"]
+
+Error: "Invalid values for tag 'lf_domain': {'invalid_value'}"
+
+Invalid permission:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: ["INVALID_PERMISSION"]
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: ["INVALID_PERMISSION"]
+
+Error: "Invalid database permissions: ['INVALID_PERMISSION']"
+
+Duplicate principal:
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: ["DESCRIBE"]
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"  # Same ARN
+      TABLE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: ["SELECT"]
+
+Error: "Duplicate principal ARNs found in configuration"
+
+Invalid tag value type:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: "risk"  # Should be ["risk"]
+          permissions: ["DESCRIBE"]
+
+Error: "Tag value must be a list for key: lf_domain"
+
+Invalid permissions type:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+          permissions: "DESCRIBE"  # Should be ["DESCRIBE"]
+
+Error: "Permissions must be a list"
+
+Missing permissions section:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+      DATABASE:
+        - tags:
+            lf_domain: ["risk"]
+
+
+Error: "Missing required fields in DATABASE: {'permissions'}"
+
+Neither DATABASE nor TABLE:
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::123456789012:role/example"
+
+
+
+
+
+
