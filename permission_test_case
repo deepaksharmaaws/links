@@ -1,3 +1,46 @@
+
+1. YAML Configuration Input and Validation
+   - Reads YAML file from S3 containing permission configurations
+   - Validates structure and content:
+     * Checks for valid principal ARNs
+     * Ensures no duplicate principals
+     * Validates DATABASE and TABLE permissions
+     * Validates tag keys and values against existing LF tags
+     * Empty DATABASE/TABLE lists are valid (indicates permission revocation)
+
+2. Current Permission Analysis
+   - Fetches current Lake Formation permissions for all principals
+   - Organizes permissions by:
+     * Principal ARN
+     * Resource type (DATABASE/TABLE)
+     * Tag expressions
+     * Granted permissions
+
+3. Permission Comparison (Delta Analysis)
+   For each principal in YAML:
+   a) If principal has empty resource list (DATABASE: [] or TABLE: []):
+      - Adds to revoke list if current permissions exist
+      - Indicates complete removal of permissions for that resource type
+
+   b) If principal has defined permissions:
+      - Compares against current permissions
+      - Checks both tag expressions and permission lists
+      - Three possible outcomes:
+        * Grant: New or different permissions needed
+        * Revoke: Current permissions need removal
+        * No Change: Current permissions match proposed
+
+   c) Delta Categorization:
+      - grant_permissions: New permissions to be added
+      - revoke_permissions: Existing permissions to be removed
+      - no_change_permissions: Permissions that match current state
+
+4. Permission Application
+   - Processes revokes first (to avoid conflicts)
+   - If revokes succeed, processes grants
+   - Uses batch operations for efficiency
+   - Stops process if revokes fail (prevents inconsistent state)
+
 1. To Keep TABLE Permissions Unchanged (NO CHANGES):
 
 permissions:
