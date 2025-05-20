@@ -1,0 +1,804 @@
+
+import os
+import sys
+import pytest
+import json
+import yaml
+import boto3
+import logging
+from moto import mock_aws
+from unittest.mock import patch, MagicMock
+from botocore.exceptions import ClientError
+
+import pytest
+
+from src.lf_tag_assignment import LFTagConfigValidator,TagChangeTracker,LFTagManager
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# Test Constants
+TEST_ADMIN_ROLE_ARN = 'arn:aws:iam::123456789012:role/LFAdmin'
+TEST_BUCKET = 'test-bucket'
+TEST_KEY = 'test/config.yaml'
+TEST_ACCOUNT_ID = '123456789012'
+
+# Test Config Constants
+TEST_DATABASE = 'testdb'
+TEST_TABLE = 'testtable'
+TEST_COLUMN = 'testcolumn'
+
+# Test Tag Constants
+TEST_TAGS = {
+    'lf_layer': 'silver',
+    'lf_domain': 'risk',
+    'lf_sensitivity': 'public'
+}
+
+# Mock AWS Response Constants
+MOCK_LF_TAGS = {
+    'LFTags': [
+        {
+            'TagKey': 'lf_layer',
+            'TagValues': ['bronze', 'silver', 'gold']
+        },
+        {
+            'TagKey': 'lf_domain',
+            'TagValues': ['risk', 'finance', 'marketing']
+        },
+        {
+            'TagKey': 'lf_sensitivity',
+            'TagValues': ['public', 'private', 'confidential']
+        }
+    ]
+}
+
+MOCK_CONFIG = {
+    "database": {
+        "name": TEST_DATABASE,
+        "tags": {
+            "lf_layer": "silver"
+        },
+        "tables": [
+            {
+                "name": TEST_TABLE,
+                "tags": {
+                    "lf_domain": "risk"
+                },
+                "columns": [
+                    {
+                        "name": TEST_COLUMN,
+                        "tags": {
+                            "lf_sensitivity": "public"
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+}
+
+@pytest.fixture(scope="class")
+def aws_credentials():
+    """Mocked AWS Credentials for the entire test class"""
+    os.environ['AWS_ACCESS_KEY_ID'] = 'testing'
+    os.environ['AWS_SECRET_ACCESS_KEY'] = 'testing'
+    os.environ['AWS_SESSION_TOKEN'] = 'testing'
+    os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
+    os.environ['LF_ADMIN_ROLE_ARN'] = TEST_ADMIN_ROLE_ARN
+    yield
+    # Clean up environment variables after tests
+    for key in ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+                'AWS_DEFAULT_REGION', 'LF_ADMIN_ROLE_ARN']:
+        os.environ.pop(key, None)
+
+@pytest.fixture(scope="function")
+def mock_aws_clients():
+    """Mock AWS clients with basic successful responses"""
+    with patch('boto3.client') as mock_boto:
+        # Mock S3
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {
+            'Body': MagicMock(read=lambda: yaml.dump(MOCK_CONFIG).encode('utf-8'))
+        }
+
+        # Mock STS
+        mock_sts = MagicMock()
+        mock_sts.assume_role.return_value = {
+            'Credentials': {
+                'AccessKeyId': 'test',
+                'SecretAccessKey': 'test',
+                'SessionToken': 'test'
+            }
+        }
+
+        # Mock Lake Formation
+        mock_lf = MagicMock()
+        mock_lf.get_paginator.return_value.paginate.return_value = [MOCK_LF_TAGS]
+        mock_lf.get_resource_lf_tags.return_value = {
+            'LFTagOnDatabase': [
+                {'TagKey': 'lf_layer', 'TagValues': ['silver']}
+            ]
+        }
+
+        # Mock Glue
+        mock_glue = MagicMock()
+        mock_glue.get_database.return_value = {'Database': {'Name': TEST_DATABASE}}
+        mock_glue.get_table.return_value = {
+            'Table': {
+                'Name': TEST_TABLE,
+                'StorageDescriptor': {
+                    'Columns': [{'Name': TEST_COLUMN}]
+                }
+            }
+        }
+
+        def get_client(service_name, **kwargs):
+            if service_name == 's3':
+                return mock_s3
+            elif service_name == 'sts':
+                return mock_sts
+            elif service_name == 'lakeformation':
+                return mock_lf
+            elif service_name == 'glue':
+                return mock_glue
+            return MagicMock()
+
+        mock_boto.side_effect = get_client
+        yield {
+            's3': mock_s3,
+            'sts': mock_sts,
+            'lf': mock_lf,
+            'glue': mock_glue
+        }
+
+
+class TestLFTagConfigValidator:
+    """Test suite for LFTagConfigValidator class"""
+
+    @pytest.fixture
+    def valid_config(self):
+        """Fixture providing valid configuration for testing"""
+        return {
+            "database": {
+                "name": "testdb",
+                "tags": {
+                    "lf_layer": "silver"
+                },
+                "tables": [
+                    {
+                        "name": "customer",
+                        "tags": {
+                            "lf_domain": "risk"
+                        },
+                        "columns": [
+                            {
+                                "name": "customer_id",
+                                "tags": {
+                                    "lf_data_sensitivity": "public"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+    def test_01_validate_tags_success(self):
+        """Test successful tag validation"""
+        valid_tags = {
+            "lf_layer": "silver",
+            "lf_domain": "risk"
+        }
+        # Should not raise an exception
+        LFTagConfigValidator.validate_tags(valid_tags)
+        logger.info("Validate tags success test passed")
+
+    def test_02_validate_tags_none(self):
+        """Test validation with None tags"""
+        # Should not raise an exception
+        LFTagConfigValidator.validate_tags(None)
+        logger.info("Validate tags None test passed")
+
+    def test_03_validate_tags_invalid_type(self):
+        """Test validation with invalid tag type"""
+        invalid_tags = ["not_a_dict", 123, True]
+        for tags in invalid_tags:
+            with pytest.raises(ValueError) as exc_info:
+                LFTagConfigValidator.validate_tags(tags)
+            assert "Tags must be a dictionary" in str(exc_info.value)
+        logger.info("Validate tags invalid type test passed")
+
+    def test_04_validate_tags_invalid_values(self):
+        """Test validation with invalid tag values"""
+        invalid_tags = {
+            "key1": 123,  # Non-string value
+            "key2": ["list_value"],  # List value
+            123: "value"  # Non-string key
+        }
+        with pytest.raises(ValueError) as exc_info:
+            LFTagConfigValidator.validate_tags(invalid_tags)
+        assert "Tag keys and values must be strings" in str(exc_info.value)
+        logger.info("Validate tags invalid values test passed")
+
+    def test_05_validate_column_success(self):
+        """Test successful column validation"""
+        valid_column = {
+            "name": "customer_id",
+            "tags": {
+                "lf_data_sensitivity": "public"
+            }
+        }
+        # Should not raise an exception
+        LFTagConfigValidator.validate_column(valid_column)
+        logger.info("Validate column success test passed")
+
+    def test_06_validate_column_invalid_type(self):
+        """Test validation with invalid column type"""
+        invalid_columns = ["not_a_dict", 123, True]
+        for column in invalid_columns:
+            with pytest.raises(ValueError) as exc_info:
+                LFTagConfigValidator.validate_column(column)
+            assert "Column must be a dictionary" in str(exc_info.value)
+        logger.info("Validate column invalid type test passed")
+
+    def test_07_validate_column_missing_name(self):
+        """Test validation with missing column name"""
+        invalid_column = {
+            "tags": {
+                "lf_data_sensitivity": "public"
+            }
+        }
+        with pytest.raises(ValueError) as exc_info:
+            LFTagConfigValidator.validate_column(invalid_column)
+        assert "Column must have a 'name' field" in str(exc_info.value)
+        logger.info("Validate column missing name test passed")
+
+    def test_08_validate_config_success(self, valid_config):
+        """Test successful configuration validation"""
+        # Should not raise an exception
+        LFTagConfigValidator.validate_config(valid_config)
+        logger.info("Validate config success test passed")
+
+    def test_09_validate_config_minimal(self):
+        """Test validation with minimal configuration"""
+        minimal_config = {
+            "database": {
+                "name": "testdb"
+            }
+        }
+        # Should not raise an exception
+        LFTagConfigValidator.validate_config(minimal_config)
+        logger.info("Validate minimal config test passed")
+
+    def test_10_validate_config_invalid_type(self):
+        """Test validation with invalid config type"""
+        invalid_configs = ["not_a_dict", 123, True]
+        for config in invalid_configs:
+            with pytest.raises(ValueError) as exc_info:
+                LFTagConfigValidator.validate_config(config)
+            assert "Config must be a dictionary" in str(exc_info.value)
+        logger.info("Validate config invalid type test passed")
+
+    def test_11_validate_config_missing_database(self):
+        """Test validation with missing database"""
+        invalid_config = {}
+        with pytest.raises(ValueError) as exc_info:
+            LFTagConfigValidator.validate_config(invalid_config)
+        assert "Database configuration must be specified" in str(exc_info.value)
+        logger.info("Validate config missing database test passed")
+
+    def test_12_validate_config_duplicate_columns(self):
+        """Test validation with duplicate column names"""
+        config_with_duplicates = {
+            "database": {
+                "name": "testdb",
+                "tables": [
+                    {
+                        "name": "customer",
+                        "columns": [
+                            {"name": "col1", "tags": {"tag1": "value1"}},
+                            {"name": "col1", "tags": {"tag2": "value2"}}  # Duplicate
+                        ]
+                    }
+                ]
+            }
+        }
+        with pytest.raises(ValueError) as exc_info:
+            LFTagConfigValidator.validate_config(config_with_duplicates)
+        assert "Duplicate column name" in str(exc_info.value)
+        logger.info("Validate config duplicate columns test passed")
+
+
+class TestTagChangeTracker:
+    """Test suite for TagChangeTracker class"""
+
+    @pytest.fixture
+    def sample_changes(self):
+        """Fixture providing sample tag changes"""
+        return {
+            'add': {'lf_domain': 'analytics'},
+            'update': {'lf_sensitivity': {'old_value': 'public', 'new_value': 'confidential'}},
+            'remove': {'lf_layer': 'bronze'},
+            'unchanged': {'lf_owner': 'data_team'}
+        }
+
+    def test_01_track_changes_success(self, sample_changes):
+        """Test successful tracking of changes"""
+        tracker = TagChangeTracker()
+        tracker.track_changes('database', 'testdb', sample_changes)
+
+        assert tracker.has_changes is True
+        assert 'testdb' in tracker.changes['database_changes']
+        assert tracker.changes['database_changes']['testdb']['added'] == sample_changes['add']
+        assert tracker.changes['database_changes']['testdb']['updated'] == sample_changes['update']
+        logger.info("Track changes success test passed")
+
+    def test_02_track_no_changes(self):
+        """Test tracking when no changes present"""
+        tracker = TagChangeTracker()
+        no_changes = {
+            'add': {},
+            'update': {},
+            'remove': {},
+            'unchanged': {'tag1': 'value1'}
+        }
+
+        tracker.track_changes('database', 'testdb', no_changes)
+        assert tracker.has_changes is False
+        logger.info("Track no changes test passed")
+
+    def test_03_track_changes_multiple_resources(self, sample_changes):
+        """Test tracking changes for multiple resources"""
+        tracker = TagChangeTracker()
+
+        # Track changes for different resource types
+        tracker.track_changes('database', 'db1', sample_changes)
+        tracker.track_changes('table', 'table1', sample_changes)
+        tracker.track_changes('column', 'column1', sample_changes)
+
+        assert len(tracker.changes['database_changes']) == 1
+        assert len(tracker.changes['table_changes']) == 1
+        assert len(tracker.changes['column_changes']) == 1
+        logger.info("Track multiple resources test passed")
+
+    def test_04_track_changes_invalid_resource_type(self, sample_changes):
+        """Test tracking changes with invalid resource type"""
+        tracker = TagChangeTracker()
+        with pytest.raises(KeyError):
+            tracker.track_changes('invalid_type', 'resource', sample_changes)
+        logger.info("Track invalid resource type test passed")
+
+    def test_05_get_summary_no_changes(self):
+        """Test get_summary with no changes"""
+        tracker = TagChangeTracker()
+        summary = tracker.get_summary()
+
+        assert summary == {'message': 'No tag changes were needed.'}
+        logger.info("Get summary no changes test passed")
+
+    def test_06_get_summary_with_changes(self, sample_changes):
+        """Test get_summary with changes"""
+        tracker = TagChangeTracker()
+        tracker.track_changes('database', 'testdb', sample_changes)
+
+        summary = tracker.get_summary()
+
+        assert 'message' in summary
+        assert 'changes' in summary
+        assert 'statistics' in summary
+        assert 'database_changes' in summary['changes']
+        logger.info("Get summary with changes test passed")
+
+    def test_07_statistics_calculation(self, sample_changes):
+        """Test statistics calculation"""
+        tracker = TagChangeTracker()
+        tracker.track_changes('database', 'testdb', sample_changes)
+
+        summary = tracker.get_summary()
+        stats = summary['statistics']
+
+        assert stats['total_resources_modified'] == 1
+        assert stats['total_tags_added'] == 1
+        assert stats['total_tags_updated'] == 1
+        assert stats['total_tags_removed'] == 1
+        logger.info("Statistics calculation test passed")
+
+    def test_08_empty_changes(self):
+        """Test tracking empty changes"""
+        tracker = TagChangeTracker()
+        empty_changes = {
+            'add': {},
+            'update': {},
+            'remove': {},
+            'unchanged': {}
+        }
+
+        tracker.track_changes('database', 'testdb', empty_changes)
+        summary = tracker.get_summary()
+
+        assert not tracker.has_changes
+        assert summary['message'] == 'No tag changes were needed.'
+        logger.info("Empty changes test passed")
+
+    def test_09_track_changes_same_resource(self, sample_changes):
+        """Test tracking multiple changes for the same resource"""
+        tracker = TagChangeTracker()
+
+        # Track changes twice for the same resource
+        tracker.track_changes('database', 'testdb', sample_changes)
+        tracker.track_changes('database', 'testdb', sample_changes)
+
+        summary = tracker.get_summary()
+        assert summary['statistics']['total_resources_modified'] == 1
+        logger.info("Track changes same resource test passed")
+
+    def test_10_track_changes_structure(self):
+        """Test structure of tracked changes"""
+        tracker = TagChangeTracker()
+        changes = {
+            'add': {'new_tag': 'value'},
+            'update': {'existing_tag': {'old_value': 'old', 'new_value': 'new'}},
+            'remove': {'old_tag': 'value'},
+            'unchanged': {'stable_tag': 'value'}
+        }
+
+        tracker.track_changes('database', 'testdb', changes)
+        resource_changes = tracker.changes['database_changes']['testdb']
+
+        assert all(key in resource_changes for key in ['added', 'updated', 'removed', 'unchanged'])
+        logger.info("Track changes structure test passed")
+
+    def test_11_summary_format_validation(self, sample_changes):
+        """Test format of the summary output"""
+        tracker = TagChangeTracker()
+        tracker.track_changes('database', 'testdb', sample_changes)
+
+        summary = tracker.get_summary()
+        required_fields = ['message', 'changes', 'statistics']
+        required_stats = [
+            'total_resources_modified',
+            'total_tags_added',
+            'total_tags_updated',
+            'total_tags_removed',
+            'total_tags_unchanged'
+        ]
+
+        assert all(field in summary for field in required_fields)
+        assert all(stat in summary['statistics'] for stat in required_stats)
+        logger.info("Summary format validation test passed")
+
+    def test_12_track_changes_validation(self):
+        """
+        Test validation of changes input
+
+        Verifies that:
+        - Invalid change types raise appropriate errors
+        - String cannot be used as dictionary update
+        - Proper error message is raised
+        """
+        tracker = TagChangeTracker()
+        invalid_changes = {
+            'add': 'not_a_dict',  # Should be a dict
+            'update': {},
+            'remove': {},
+            'unchanged': {}
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            tracker.track_changes('database', 'testdb', invalid_changes)
+
+        assert "dictionary update sequence element" in str(exc_info.value)
+        logger.info("Track changes validation test passed")
+
+
+class TestLFTagManager:
+    """Test suite for LFTagManager class"""
+
+    @pytest.fixture
+    def valid_config(self):
+        """Fixture providing valid configuration"""
+        return {
+            "database": {
+                "name": "testdb",
+                "tags": {
+                    "lf_layer": "silver"
+                },
+                "tables": [
+                    {
+                        "name": "customer",
+                        "tags": {
+                            "lf_domain": "risk"
+                        },
+                        "columns": [
+                            {
+                                "name": "customer_id",
+                                "tags": {
+                                    "lf_sensitivity": "public"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+    @pytest.fixture
+    def mock_lf_tags(self):
+        """Fixture providing mock Lake Formation tags"""
+        return {
+            'LFTags': [
+                {
+                    'TagKey': 'lf_layer',
+                    'TagValues': ['bronze', 'silver', 'gold']
+                },
+                {
+                    'TagKey': 'lf_domain',
+                    'TagValues': ['risk', 'finance', 'marketing']
+                },
+                {
+                    'TagKey': 'lf_sensitivity',
+                    'TagValues': ['public', 'private', 'confidential']
+                }
+            ]
+        }
+
+    def test_01_initialization_success(self, mock_aws_clients):
+        """Test successful initialization of LFTagManager"""
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        assert manager is not None
+        assert manager.lakeformation is not None
+        assert manager.glue is not None
+        assert manager.s3 is not None
+        logger.info("LFTagManager initialization test passed")
+
+    def test_02_initialization_failure(self, mock_aws_clients):
+        """Test initialization failure with invalid role"""
+        mock_aws_clients['sts'].assume_role.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}},
+            'AssumeRole'
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            LFTagManager(TEST_ADMIN_ROLE_ARN)
+
+        # Check for either the AWS error message or our logged error message
+        error_message = str(exc_info.value)
+        assert any([
+            'AccessDenied' in error_message,
+            'Access Denied' in error_message,
+            'AssumeRole operation' in error_message
+        ]), f"Unexpected error message: {error_message}"
+
+        # Verify that the error was logged
+        logger.info("Initialization failure test passed")
+
+    def test_03_get_existing_lf_tags_success(self, mock_aws_clients, mock_lf_tags):
+        """Test successful retrieval of existing LF tags"""
+        mock_aws_clients['lf'].get_paginator.return_value.paginate.return_value = [mock_lf_tags]
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        tags = manager._get_existing_lf_tags()
+
+        assert isinstance(tags, dict)
+        assert 'lf_layer' in tags
+        assert 'silver' in tags['lf_layer']
+        logger.info("Get existing LF tags test passed")
+
+    def test_04_validate_tags_success(self, mock_aws_clients, mock_lf_tags):
+        """Test successful tag validation"""
+        mock_aws_clients['lf'].get_paginator.return_value.paginate.return_value = [mock_lf_tags]
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        valid_tags = {
+            'lf_layer': 'silver',
+            'lf_domain': 'risk'
+        }
+
+        assert manager.validate_tags(valid_tags, 'database', 'testdb')
+        logger.info("Validate tags success test passed")
+
+    def test_05_validate_tags_failure(self, mock_aws_clients, mock_lf_tags):
+        """Test tag validation failure"""
+        mock_aws_clients['lf'].get_paginator.return_value.paginate.return_value = [mock_lf_tags]
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        invalid_tags = {
+            'lf_layer': 'invalid_value',
+            'invalid_key': 'value'
+        }
+
+        assert not manager.validate_tags(invalid_tags, 'database', 'testdb')
+        logger.info("Validate tags failure test passed")
+
+    def test_06_validate_all_tags_success(self, mock_aws_clients, mock_lf_tags, valid_config):
+        """Test successful validation of all tags in configuration"""
+        mock_aws_clients['lf'].get_paginator.return_value.paginate.return_value = [mock_lf_tags]
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        assert manager.validate_all_tags(valid_config)
+        logger.info("Validate all tags success test passed")
+
+    def test_07_check_database_exists_success(self, mock_aws_clients):
+        """Test successful database existence check"""
+        mock_aws_clients['glue'].get_database.return_value = {'Database': {'Name': 'testdb'}}
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        assert manager.check_database_exists('testdb')
+        logger.info("Check database exists test passed")
+
+    def test_08_check_database_not_exists(self, mock_aws_clients):
+        """Test database not exists check"""
+
+        # Create a proper EntityNotFoundException
+        class EntityNotFoundException(Exception):
+            pass
+
+        # Add the exception to the mock Glue client
+        mock_aws_clients['glue'].exceptions.EntityNotFoundException = EntityNotFoundException
+
+        # Set up the side effect to raise the exception
+        mock_aws_clients['glue'].get_database.side_effect = EntityNotFoundException(
+            "Database not found"
+        )
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        result = manager.check_database_exists('nonexistent_db')
+
+        # Verify the result
+        assert not result
+
+        # Verify the call was made
+        mock_aws_clients['glue'].get_database.assert_called_once_with(
+            Name='nonexistent_db'
+        )
+
+        logger.info("Check database not exists test passed")
+
+    def test_09_check_table_exists_success(self, mock_aws_clients):
+        """Test successful table existence check"""
+        mock_aws_clients['glue'].get_table.return_value = {'Table': {'Name': 'testtable'}}
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        assert manager.check_table_exists('testdb', 'testtable')
+        logger.info("Check table exists test passed")
+
+    def test_10_check_columns_exist_success(self, mock_aws_clients):
+        """Test successful column existence check"""
+        mock_aws_clients['glue'].get_table.return_value = {
+            'Table': {
+                'StorageDescriptor': {
+                    'Columns': [
+                        {'Name': 'col1'},
+                        {'Name': 'col2'}
+                    ]
+                }
+            }
+        }
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        result = manager.check_columns_exist('testdb', 'testtable', ['col1', 'col2'])
+        assert all(result.values())
+        logger.info("Check columns exist test passed")
+
+    def test_11_process_file_success(self, mock_aws_clients, valid_config, mock_lf_tags):
+        """Test successful file processing"""
+        # Setup mock responses
+        mock_aws_clients['s3'].get_object.return_value = {
+            'Body': MagicMock(read=lambda: yaml.dump(valid_config).encode('utf-8'))
+        }
+        mock_aws_clients['lf'].get_paginator.return_value.paginate.return_value = [mock_lf_tags]
+        mock_aws_clients['glue'].get_database.return_value = {'Database': {'Name': 'testdb'}}
+        mock_aws_clients['glue'].get_table.return_value = {
+            'Table': {
+                'StorageDescriptor': {
+                    'Columns': [{'Name': 'customer_id'}]
+                }
+            }
+        }
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        result = manager.process_file(TEST_BUCKET, TEST_KEY)
+
+        # Check if result is not None (indicating success)
+        assert result is not None
+
+        # Check if result is a dictionary
+        assert isinstance(result, dict)
+
+        # Check for expected keys in the result
+        expected_keys = ['message', 'changes', 'statistics']
+        for key in expected_keys:
+            assert key in result, f"Expected key '{key}' not found in result"
+
+        # Check if changes were applied
+        assert result['changes'], "No changes were applied"
+
+        # Check if statistics are present and make sense
+        assert result['statistics']['total_resources_modified'] > 0
+        assert result['statistics']['total_tags_added'] > 0
+
+        logger.info("Process file success test passed")
+
+    def test_12_process_file_validation_error(self, mock_aws_clients, valid_config):
+        """Test file processing with validation error"""
+        # Modify config to make it invalid
+        invalid_config = valid_config.copy()
+        invalid_config['database']['tags']['invalid_tag'] = 'invalid_value'
+
+        mock_aws_clients['s3'].get_object.return_value = {
+            'Body': MagicMock(read=lambda: yaml.dump(invalid_config).encode('utf-8'))
+        }
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        result = manager.process_file(TEST_BUCKET, TEST_KEY)
+
+        assert result['statusCode'] == 400
+        assert 'validation failed' in result['body'].lower()
+        logger.info("Process file validation error test passed")
+
+    def test_13_get_current_resource_tags(self, mock_aws_clients):
+        """Test getting current resource tags"""
+        mock_aws_clients['lf'].get_resource_lf_tags.return_value = {
+            'LFTagOnDatabase': [
+                {'TagKey': 'lf_layer', 'TagValues': ['silver']}
+            ]
+        }
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        resource = {'Database': {'Name': 'testdb'}}
+        tags = manager.get_current_resource_tags(resource)
+
+        assert 'lf_layer' in tags
+        assert tags['lf_layer'] == 'silver'
+        logger.info("Get current resource tags test passed")
+
+    def test_14_apply_tag_changes(self, mock_aws_clients):
+        """Test applying tag changes"""
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        resource = {'Database': {'Name': 'testdb'}}
+        tag_changes = {
+            'add': {'new_tag': 'value'},
+            'update': {},
+            'remove': {},
+            'unchanged': {}
+        }
+
+        # Should not raise an exception
+        manager.apply_tag_changes(resource, tag_changes)
+
+        # Verify call to add_lf_tags_to_resource
+        mock_aws_clients['lf'].add_lf_tags_to_resource.assert_called_once()
+        logger.info("Apply tag changes test passed")
+
+    def test_15_load_config_from_s3_error(self, mock_aws_clients):
+        """Test loading invalid config from S3"""
+        mock_aws_clients['s3'].get_object.side_effect = ClientError(
+            {'Error': {'Code': 'NoSuchKey', 'Message': 'The specified key does not exist.'}},
+            'GetObject'
+        )
+
+        manager = LFTagManager(TEST_ADMIN_ROLE_ARN)
+        with pytest.raises(Exception) as exc_info:
+            manager.load_config_from_s3(TEST_BUCKET, TEST_KEY)
+
+        # Check either for the exact error message or parts of it
+        error_message = str(exc_info.value)
+        assert any([
+            'NoSuchKey' in error_message,
+            'The specified key does not exist' in error_message,
+            'Error loading config from S3' in error_message
+        ]), f"Unexpected error message: {error_message}"
+
+        # Verify that the error was logged
+        # You might need to use a caplog fixture to verify this
+        logger.info("Load config from S3 error test passed")
+
+
+
+
+
+
+
