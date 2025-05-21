@@ -38,6 +38,21 @@ database:
           tags:
             lf_data_sensitivity: restricted
 
+
+Invalid Configuration Examples:
+
+# 1. Invalid Multiple Databases Structure
+databases:  # Invalid - multiple databases not supported
+  - database:
+      name: growthdb
+      tags:
+        lf_layer: silver
+  - database:
+      name: riskdb
+      tags:
+        lf_layer: bronze
+
+
 # 1. Missing Database Name
 database:
   tags:
@@ -45,23 +60,7 @@ database:
 
 # Expected Error: "Database must have a 'name' field of type string"
 
-# 2. Invalid Tag Value
-database:
-  name: growthdb
-  tags:
-    lf_domain: invalid_domain  # Invalid value not in allowed list
-    lf_data_sensitivity: public
 
-# Expected Error: "Tag value 'invalid_domain' is not allowed for key 'lf_domain'"
-
-# 3. Invalid Tag Key
-database:
-  name: growthdb
-  tags:
-    invalid_tag: value  # Key doesn't exist in LF tags
-    lf_data_sensitivity: public
-
-# Expected Error: "Tag key 'invalid_tag' does not exist"
 
 # 4. Invalid Table Structure
 database:
@@ -98,7 +97,11 @@ database:
 
 # Expected Error: "Duplicate column name: customer_id"
 
-# non_existent_database.yaml
+
+Resource Validation Examples:
+
+
+# 1. Non-existent Database
 database:
   name: nonexistentdb  # Database doesn't exist in Glue Catalog
   tags:
@@ -119,7 +122,7 @@ database:
     }
 }
 
- #non_existent_tables.yaml
+ # 2. Non-existent Table
 database:
   name: growthdb  # Existing database
   tags:
@@ -149,7 +152,7 @@ database:
 }
 
 
-# non_existent_columns.yaml
+# 3. Non-existent Column
 database:
   name: growthdb
   tables:
@@ -176,6 +179,211 @@ database:
     }
 }
 
+
+# 2. Invalid Tag Value
+database:
+  name: growthdb
+  tags:
+    lf_domain: invalid_domain  # Invalid value not in allowed list
+    lf_data_sensitivity: public
+
+# Expected Error: "Tag value 'invalid_domain' is not allowed for key 'lf_domain'"
+
+# 3. Invalid Tag Key
+database:
+  name: growthdb
+  tags:
+    invalid_tag: value  # Key doesn't exist in LF tags
+    lf_data_sensitivity: public
+
+# Expected Error: "Tag key 'invalid_tag' does not exist"
+
+#l explain tag changes scenarios with initial setup and subsequent modifications:
+
+Initial Setup in Lake Formation:
+
+Database (growthdb):
+lf_layer: bronze
+
+Tables (growthdb.customer):
+lf_visibility: private
+lf_domain: risk
+
+Columns (growthdb.customer):
+customer_id:
+  lf_data_sensitivity: public
+  lf_data_element: id
+ssn:
+  lf_data_sensitivity: restricted
+  lf_data_element: ssn
+
+New YAML Configuration (Changes):
+
+database:
+  name: growthdb
+  tags:
+    lf_layer: silver          # Update: bronze -> silver
+    lf_category: finance      # Add: new tag
+  tables:
+    - name: customer
+      tags:
+        lf_visibility: private  # Unchanged
+        lf_domain: growth      # Update: risk -> growth
+        lf_retention: p30      # Add: new tag
+      columns:
+        - name: customer_id
+          tags:
+            lf_data_sensitivity: public     # Unchanged
+            lf_data_element: identifier     # Update: id -> identifier
+            lf_classification: internal     # Add: new tag
+        - name: ssn
+          tags:
+            lf_data_element: ssn           # Unchanged
+            # lf_data_sensitivity removed
+        - name: email                      # New column
+          tags:
+            lf_data_sensitivity: confidential
+            lf_data_element: email
+
+ Expected Response
+
+
+{
+    "statusCode": 200,
+    "body": {
+        "message": "Successfully applied the following tag changes",
+        "changes": {
+            "database_changes": {
+                "growthdb": {
+                    "added": {
+                        "lf_category": "finance"
+                    },
+                    "updated": {
+                        "lf_layer": {
+                            "old_value": "bronze",
+                            "new_value": "silver"
+                        }
+                    },
+                    "removed": {},
+                    "unchanged": {}
+                }
+            },
+            "table_changes": {
+                "customer": {
+                    "added": {
+                        "lf_retention": "p30"
+                    },
+                    "updated": {
+                        "lf_domain": {
+                            "old_value": "risk",
+                            "new_value": "growth"
+                        }
+                    },
+                    "removed": {},
+                    "unchanged": {
+                        "lf_visibility": "private"
+                    }
+                }
+            },
+            "column_changes": {
+                "customer.customer_id": {
+                    "added": {
+                        "lf_classification": "internal"
+                    },
+                    "updated": {
+                        "lf_data_element": {
+                            "old_value": "id",
+                            "new_value": "identifier"
+                        }
+                    },
+                    "removed": {},
+                    "unchanged": {
+                        "lf_data_sensitivity": "public"
+                    }
+                },
+                "customer.ssn": {
+                    "added": {},
+                    "updated": {},
+                    "removed": {
+                        "lf_data_sensitivity": "restricted"
+                    },
+                    "unchanged": {
+                        "lf_data_element": "ssn"
+                    }
+                },
+                "customer.email": {
+                    "added": {
+                        "lf_data_sensitivity": "confidential",
+                        "lf_data_element": "email"
+                    },
+                    "updated": {},
+                    "removed": {},
+                    "unchanged": {}
+                }
+            }
+        },
+        "statistics": {
+            "total_resources_modified": 5,
+            "total_tags_added": 5,
+            "total_tags_updated": 3,
+            "total_tags_removed": 1,
+            "total_tags_unchanged": 4
+        }
+    }
+}
+
+Here's a YAML file that matches the existing Lake Formation setup, resulting in no changes and the corresponding response:
+
+Existing Lake Formation Setup:
+
+Database (analyticsdb):
+lf_layer: silver
+
+Tables (analyticsdb.user_activity):
+lf_visibility: private
+lf_domain: analytics
+
+Columns (analyticsdb.user_activity):
+user_id:
+  lf_data_sensitivity: public
+  lf_data_element: id
+activity_type:
+  lf_data_sensitivity: confidential
+  lf_data_element: category
+timestamp:
+  lf_data_sensitivity: public
+  lf_data_element: datetime
+
+YAML Configuration (Matching Existing Setup):
+
+database:
+  name: analyticsdb
+  tags:
+    lf_layer: silver
+  tables:
+    - name: user_activity
+      tags:
+        lf_visibility: private
+        lf_domain: analytics
+      columns:
+        - name: user_id
+          tags:
+            lf_data_sensitivity: public
+            lf_data_element: id
+        - name: activity_type
+          tags:
+            lf_data_sensitivity: confidential
+            lf_data_element: category
+        - name: timestamp
+          tags:
+            lf_data_sensitivity: public
+            lf_data_element: datetime
+
+Expected output:
+{
+  "statusCode": 200,
+  "body": "{\"message\": \"No tag changes were needed.\"}"
+}
 
 
 
