@@ -336,7 +336,113 @@ permissions:
       arn: "arn:aws:iam::123456789012:role/example"
 
 
+=========
+Input 
 
+permissions:
+  - principal:
+      arn: "arn:aws:iam::263040894588:role/data-analyst-growth"
+      DATABASE:
+        - tags:
+            lf_domain:
+              - growth
+            lf_data_sensitivity:
+              - public
+          permissions:
+            - DESCRIBE
+      TABLE:
+        - tags:
+            lf_domain:
+              - risk
+            lf_data_sensitivity:
+              - public
+          permissions:
+            - DESCRIBE
+            - SELECT
+
+
+
+
+
+
+
+
+
+{
+  "changes": {
+    "grants": [
+      {
+        "principal": "arn:aws:iam::263040894588:role/data-analyst-growth",
+        "resource_type": "TABLE",
+        "permissions": [
+          "DESCRIBE",
+          "SELECT"
+        ],
+        "tag_expressions": [
+          {
+            "TagKey": "lf_domain",
+            "TagValues": [
+              "risk"
+            ]
+          },
+          {
+            "TagKey": "lf_data_sensitivity",
+            "TagValues": [
+              "public"
+            ]
+          }
+        ]
+      }
+    ],
+    "revokes": [
+      {
+        "principal": "arn:aws:iam::263040894588:role/data-analyst-growth",
+        "resource_type": "TABLE",
+        "permissions": [
+          "DESCRIBE",
+          "SELECT"
+        ],
+        "tag_expressions": [
+          {
+            "TagKey": "lf_domain",
+            "TagValues": [
+              "growth"
+            ]
+          },
+          {
+            "TagKey": "lf_data_sensitivity",
+            "TagValues": [
+              "public"
+            ]
+          }
+        ]
+      }
+    ],
+    "no_changes": [
+      {
+        "principal": "arn:aws:iam::263040894588:role/data-analyst-growth",
+        "resource_type": "DATABASE",
+        "permissions": [
+          "DESCRIBE"
+        ],
+        "tag_expressions": [
+          {
+            "TagKey": "lf_domain",
+            "TagValues": [
+              "growth"
+            ]
+          },
+          {
+            "TagKey": "lf_data_sensitivity",
+            "TagValues": [
+              "public"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
 
 
 
