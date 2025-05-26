@@ -77,4 +77,109 @@ def main():
 if __name__ == "__main__":
     main()
 
- 
+
+
+===========
+
+
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
+# Initialize job
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'warehouse_path',
+    'aws_region',
+    'aws_account_id',
+    'catalog_name'
+])
+
+# Initialize contexts and job
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Get arguments
+catalog_name = args['catalog_name']
+aws_region = args['aws_region']
+aws_account_id = args['aws_account_id']
+warehouse_path = args['warehouse_path']
+
+def create_dynamic_frame(database, table_name):
+    """Create a dynamic frame from a Glue catalog table"""
+    try:
+        dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+            database=database,
+            table_name=table_name,
+            transformation_ctx=f"dynamic_frame_{database}_{table_name}"
+        )
+        return dynamic_frame
+    except Exception as e:
+        print(f"Error creating dynamic frame for {database}.{table_name}: {str(e)}")
+        return None
+
+def process_dynamic_frame(dynamic_frame, name):
+    """Process and display dynamic frame information"""
+    try:
+        print(f"\nProcessing: {name}")
+        print("\nSchema:")
+        dynamic_frame.printSchema()
+        
+        print("\nSample Records:")
+        dynamic_frame.show(10)
+        
+        # Get count of records
+        count = dynamic_frame.count()
+        print(f"\nTotal Records: {count}")
+        
+        return dynamic_frame
+    except Exception as e:
+        print(f"Error processing dynamic frame {name}: {str(e)}")
+        return None
+
+def main():
+    # Define tables to process
+    tables = [
+        {"database": "growth_db", "table": "customer"},
+        {"database": "growth_db", "table": "orders"},
+        {"database": "risk_db", "table": "credit_score"},
+        {"database": "risk_db", "table": "fraud_detection"}
+    ]
+    
+    # Process each table
+    for table_info in tables:
+        database = table_info["database"]
+        table = table_info["table"]
+        
+        print(f"\n{'='*50}")
+        print(f"Processing table: {database}.{table}")
+        print(f"{'='*50}")
+        
+        # Create and process dynamic frame
+        dyf = create_dynamic_frame(database, table)
+        if dyf:
+            processed_dyf = process_dynamic_frame(dyf, f"{database}.{table}")
+            
+            # Example transformation: Convert to DataFrame for additional processing if needed
+            # df = processed_dyf.toDF()
+            # ... perform additional transformations ...
+            
+            # Example: Write back to a different location if needed
+            # glueContext.write_dynamic_frame.from_options(
+            #     frame=processed_dyf,
+            #     connection_type="s3",
+            #     connection_options={"path": f"{warehouse_path}/processed/{database}/{table}"},
+            #     format="parquet"
+            # )
+
+if __name__ == "__main__":
+    main()
+    job.commit()
+
