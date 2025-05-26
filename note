@@ -7,3 +7,74 @@
     }
   ]
 }
+
+
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import SparkSession
+
+# Initialize job
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'warehouse_path',
+    'aws_region',
+    'aws_account_id',
+    'catalog_name'
+])
+
+catalog_name = args['catalog_name']
+aws_region = args['aws_region']
+aws_account_id = args['aws_account_id']
+warehouse_path = args['warehouse_path']
+
+spark = SparkSession.builder \
+    .config(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkSessionCatalog") \
+    .config(f"spark.sql.catalog.{catalog_name}.warehouse", f"{warehouse_path}") \
+    .config(f"spark.sql.catalog.{catalog_name}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+    .config(f"spark.sql.catalog.{catalog_name}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+    .config(f"spark.sql.catalog.{catalog_name}.client.region", f"{aws_region}") \
+    .config(f"spark.sql.catalog.{catalog_name}.glue.account-id", f"{aws_account_id}") \
+    .getOrCreate()
+
+
+def run_query(query_name, query):
+    """Execute Spark SQL query and display results"""
+    try:
+        print(f"\nExecuting query: {query_name}")
+        print(f"SQL: {query}")
+
+        df = spark.sql(query)
+
+        print("\nResults:")
+        df.show(truncate=False)
+
+        print("\nSchema:")
+        df.printSchema()
+
+    except Exception as e:
+        print(f"Error executing query: {str(e)}")
+
+
+def main():
+    # Sample queries
+    queries = {
+        "Growth_Customer": f""" SELECT * FROM {catalog_name}.growth_db.customer """,
+        "Growth_Orders": f""" SELECT * FROM {catalog_name}.growth_db.orders """,
+        "Risk_Credit_Score": f""" SELECT * FROM {catalog_name}.risk_db.credit_score """,
+        "Risk_fraud_detection": f""" SELECT * FROM {catalog_name}.risk_db.fraud_detection """,
+    }
+
+    # Execute each query
+    for query_name, query in queries.items():
+        run_query(query_name, query)
+
+
+if __name__ == "__main__":
+    main()
+
+ 
