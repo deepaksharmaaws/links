@@ -1,0 +1,142 @@
+# Create example database
+resource "awscc_glue_database" "example" {
+  catalog_id = data.aws_caller_identity.current.account_id
+  database_input = {
+    name        = "example_db"
+    description = "Example database for Lake Formation tag association"
+  }
+}
+
+# Create example LF-Tag
+resource "awscc_lakeformation_tag" "example" {
+  catalog_id = data.aws_caller_identity.current.account_id
+  tag_key    = "environment"
+  tag_values = ["dev", "test", "prod"]
+}
+
+# Create the tag association
+resource "awscc_lakeformation_tag_association" "example" {
+  lf_tags = [{
+    catalog_id = data.aws_caller_identity.current.account_id
+    tag_key    = awscc_lakeformation_tag.example.tag_key
+    tag_values = ["dev"]
+  }]
+
+  resource = {
+    database = {
+      catalog_id = data.aws_caller_identity.current.account_id
+      name       = awscc_glue_database.example.database_input.name
+    }
+  }
+}
+=====database:
+  name: demo_silver_db
+  tags:
+    Layer: Silver
+  tables:
+    - name: web_event_router_v1_web_vendor_action_triggered
+      tags:
+        Visibility: Private
+        Domain: Growth
+      columns:
+        - name: _event_context_event_producer
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_event_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_additional_context
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_app_version
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_name
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_campaign_term
+          tags:
+            DataSensitivity: Confidential
+    - name: mobile_event_router_v1_mobile_item_collapsed
+      tags:
+        Visibility: Private
+        Domain: Growth
+      columns:
+        - name: _event_context_event_producer
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_event_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_additional_context
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_app_version
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_name
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_campaign_term
+          tags:
+            DataSensitivity: Confidential
+
+===
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::925925731365:role/data-analyst-growth-role"
+      DATABASE:
+        - tags:
+            Layer:
+              - Silver
+          permissions:
+            - DESCRIBE
+
+      TABLE:
+        - tags:
+            Layer:
+              - Silver
+            DataSensitivity:
+              - Restricted
+              - Confidential
+              - GoldPublic
+            Visibility:
+              - Private
+              - Public
+          permissions:
+            - DESCRIBE
+            - SELECT
+  - principal:
+      arn: "arn:aws:iam::925925731365:role/data-owner-growth-role"
+      DATABASE:
+        - tags:
+            Layer:
+              - Silver
+            DataSensitivity:
+              - Restricted
+          permissions:
+            - DESCRIBE
+
+      TABLE:
+        - tags:
+            Layer:
+              - Silver
+            DataSensitivity:
+              - Restricted
+              - Confidential
+              - GoldPublic
+            Visibility:
+              - Private
+              - Public
+          permissions:
+            - DESCRIBE
+            - SELECT
+
+======
