@@ -140,3 +140,78 @@ permissions:
             - SELECT
 
 ======
+
+
+# Get current AWS account ID
+data "aws_caller_identity" "current" {}
+
+# Create LF-Tags
+resource "awscc_lakeformation_tag" "layer" {
+  catalog_id = data.aws_caller_identity.current.account_id
+  tag_key    = "Layer"
+  tag_values = ["Silver"]
+}
+
+resource "awscc_lakeformation_tag" "visibility" {
+  catalog_id = data.aws_caller_identity.current.account_id
+  tag_key    = "Visibility"
+  tag_values = ["Private"]
+}
+
+resource "awscc_lakeformation_tag" "domain" {
+  catalog_id = data.aws_caller_identity.current.account_id
+  tag_key    = "Domain"
+  tag_values = ["Growth"]
+}
+
+resource "awscc_lakeformation_tag" "data_sensitivity" {
+  catalog_id = data.aws_caller_identity.current.account_id
+  tag_key    = "DataSensitivity"
+  tag_values = ["GoldPublic", "Restricted", "Confidential"]
+}
+
+# Database level tag association
+resource "awscc_lakeformation_tag_association" "database_tags" {
+  lf_tags = [{
+    catalog_id = data.aws_caller_identity.current.account_id
+    tag_key    = awscc_lakeformation_tag.layer.tag_key
+    tag_values = ["Silver"]
+  }]
+
+  resource = {
+    database = {
+      catalog_id = data.aws_caller_identity.current.account_id
+      name       = "demo_silver_db"
+    }
+  }
+}
+
+# Table level tag associations
+resource "awscc_lakeformation_tag_association" "table_tags" {
+  lf_tags = [
+    {
+      catalog_id = data.aws_caller_identity.current.account_id
+      tag_key    = awscc_lakeformation_tag.visibility.tag_key
+      tag_values = ["Private"]
+    },
+    {
+      catalog_id = data.aws_caller_identity.current.account_id
+      tag_key    = awscc_lakeformation_tag.domain.tag_key
+      tag_values = ["Growth"]
+    }
+  ]
+
+  resource = {
+    table = {
+      catalog_id    = data.aws_caller_identity.current.account_id
+      database_name = "demo_silver_db"
+      name         = "web_event_router_v1_web_vendor_action_triggered"
+    }
+  }
+}
+\\
+
+Create the four LF-Tags (Layer, Visibility, Domain, DataSensitivity)
+Associate the Layer tag with the database
+Associate Visibility and Domain tags with the web_event_router_v1_web_vendor_action_triggered table
+Associate DataSensitivity tags with the columns in the table according to the specified values
