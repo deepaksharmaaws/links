@@ -1403,3 +1403,1140 @@ class BIO(Base):
         self.get_consolidate_schema()
         self.load()
         self.post_dqc()
+=========
+
+
+job:
+  name: "Pre Enrollment"
+  description: "Build bio for Pre Enrollment"
+  alert: false
+  type : "batch"
+  env:
+    - prod
+  worker_counts: 200
+
+first_web_page_viewed_input :
+  type : input
+  connector: snowflake
+  query: >
+    select *
+    from
+        (
+          select distinct
+              p.id,
+              REGEXP_REPLACE(p.user_id, '^"|"$', '') as user_id, --sometimes null
+              REGEXP_REPLACE(p.anonymous_id, '^"|"$', '') as anonymous_id,
+              p.timestamp::date as date,
+              p.timestamp,
+              COALESCE(p.is_embedded,FALSE) as is_embedded,
+              p.context_page_url,
+              p.context_page_referrer,  -- sometimes null
+              p.context_user_agent,
+              p.ad_campaign_id, -- sometimes null
+              p.device_id  ,-- null
+              'First Page Viewed' as event,
+              'PAGES' as source_table,
+              CASE
+                WHEN LOWER(CAST(PARSE_URL(p.context_page_url, 1):parameters:ad AS STRING)) = 'tp_' THEN 
+                  'tp_' || COALESCE(
+                    cast(PARSE_URL(p.context_page_referrer, 1):parameters:ref as string),
+                    cast(PARSE_URL(p.context_page_url, 1):parameters:ref as string),
+                    ''
+                  )
+                WHEN LOWER(CAST(PARSE_URL(p.context_page_url, 1):parameters:ad AS STRING)) = 'cj' THEN 
+                  'cj_' || COALESCE(
+                    cast(PARSE_URL(p.context_page_referrer, 1):parameters:pid as string),
+                    cast(PARSE_URL(p.context_page_url, 1):parameters:pid as string),
+                    ''
+                  )
+                WHEN LOWER(CAST(PARSE_URL(p.context_page_url, 1):parameters:ad AS STRING)) = 'impact' THEN 
+                  COALESCE(
+                    cast(PARSE_URL(p.context_page_referrer, 1):parameters:ad_id as string),
+                    cast(PARSE_URL(p.context_page_url, 1):parameters:ad_id as string),
+                    ''
+                  )
+                ELSE CAST(PARSE_URL(p.context_page_url, 1):parameters:ad AS STRING)
+              END AS ad_id,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:utm_source AS STRING) AS utm_source,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:utm_medium AS STRING) AS utm_medium,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:utm_id AS STRING) AS utm_id,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:utm_content AS STRING) AS utm_content,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:utm_term AS STRING) AS utm_term,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:gclid AS STRING) AS gclid,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:fbclid AS STRING) AS fbclid,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:gad_source AS STRING) AS gad_source,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:irgwc AS STRING) AS irgwc,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:cadid AS STRING) AS cadid,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:value_prop AS STRING) AS value_prop,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:marketing_type AS STRING) AS marketing_type,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:creative AS STRING) AS creative,
+              CAST(PARSE_URL(p.context_page_url, 1):parameters:traffic_source AS STRING) AS traffic_source,
+              CASE
+                  WHEN p.is_embedded = TRUE AND LOWER(p.context_user_agent) LIKE '%android%' THEN 'Android App'
+                  WHEN p.is_embedded = TRUE AND (
+                    LOWER(p.context_user_agent) LIKE '%iphone%' OR LOWER(p.context_user_agent) LIKE '%ipad%'
+                  ) THEN 'iOS App'
+                  WHEN LOWER(p.context_user_agent) LIKE '%android%' THEN 'Android Web'
+                  WHEN LOWER(p.context_user_agent) LIKE '%iphone%' THEN 'iPhone Web'
+                  WHEN LOWER(p.context_user_agent) LIKE '%ipad%' THEN 'iPad Web'
+                  WHEN LOWER(p.context_user_agent) LIKE '%macintosh%' THEN 'Mac Web'
+                  WHEN LOWER(p.context_user_agent) LIKE '%windows%' THEN 'Windows Web'
+                  WHEN LOWER(p.context_user_agent) LIKE '%linux%' OR LOWER(p.context_user_agent) LIKE '%x11%' THEN 'Linux'
+                  WHEN LOWER(p.context_user_agent) LIKE '%facebook%' THEN 'Facebook Bot'
+                  WHEN LOWER(p.context_user_agent) LIKE '%google-speakr%' THEN 'Google Speaker'
+                  WHEN LOWER(p.context_user_agent) LIKE '%bb10%' OR LOWER(p.context_user_agent) LIKE '%kbd%' THEN 'Blackberry'
+                  WHEN LOWER(p.context_user_agent) LIKE '%google%' THEN 'Google Bot'
+                  WHEN LOWER(p.context_user_agent) LIKE '%bot%' OR LOWER(p.context_user_agent) LIKE '%spider%' THEN 'Other Crawlers'
+                  WHEN LOWER(p.context_user_agent) LIKE '%mobile%' THEN 'Other Mobile Web'
+                  ELSE 'All Other Devices'
+                END AS device_type,
+              null as enrollment_device,
+              CASE
+                  WHEN LOWER(p.context_user_agent) LIKE '%android%' THEN 'Android'
+                  WHEN LOWER(p.context_user_agent) LIKE '%iphone%' OR LOWER(p.context_user_agent) LIKE '%ipad%' OR LOWER(p.context_user_agent) LIKE '%ios%' THEN 'iOS'
+                  WHEN LOWER(p.context_user_agent) LIKE '%windows%' THEN 'Windows'
+                  WHEN LOWER(p.context_user_agent) LIKE '%macintosh%' THEN 'Mac'
+                  WHEN LOWER(p.context_user_agent) LIKE '%linux%' OR LOWER(p.context_user_agent) LIKE '%x11%' THEN 'Linux'
+                  ELSE 'Other OS'
+                END AS operating_system,
+              'na' as session_id
+          from segment.chime_prod.pages as p
+          left join SEGMENT.CHIME_PROD.ENROLLMENT_FLOW_ENTERED as e on p.anonymous_id = e.anonymous_id
+                                                                      and p.timestamp::date = e.timestamp::date
+                                                                      and e.is_embedded = TRUE
+          where 1=1
+              and p.name = 'First Page Viewed'
+              and e.is_embedded is null -- did not enter enrollment on app
+              and p.timestamp::date < date '2025-05-08'
+          
+          union all 
+
+          select 
+              _message_id AS id,
+              REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+              REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+              timestamp::DATE AS date,
+              timestamp,
+              CAST(browser:is_embedded AS BOOLEAN) AS is_embedded,
+              CAST(page:url AS STRING) AS context_page_url,
+              CAST(page:referrer_url AS STRING) AS context_page_referrer,
+              CAST(browser:user_agent AS STRING) AS context_user_agent,
+              'na' AS ad_campaign_id,
+              _device_id AS device_id,
+              'First Page Viewed' AS event,
+              'WEB_ACTION_TRIGGERED' AS source_table,
+              CASE
+                WHEN SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2) = 'tp_' THEN 
+                  'tp_' || COALESCE(
+                    cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ref as string),
+                    cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ref as string),
+                    ''
+                  )
+                WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'cj' THEN 
+                  'cj_' || COALESCE(
+                    cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:pid as string),
+                    cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:pid as string),
+                    ''
+                  )
+                WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'impact' THEN 
+                  COALESCE(
+                    cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ad_id as string),
+                    cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ad_id as string),
+                    ''
+                  )
+                ELSE SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)
+              END AS ad_id,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_source AS STRING) AS utm_source,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_medium AS STRING) AS utm_medium,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_id AS STRING) AS utm_id,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_content AS STRING) AS utm_content,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_term AS STRING) AS utm_term,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:gclid AS STRING) AS gclid,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:fbclid AS STRING) AS fbclid,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:gad_source AS STRING) AS gad_source,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:irgwc AS STRING) AS irgwc,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:cadid AS STRING) AS cadid,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:value_prop AS STRING) AS value_prop,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:marketing_type AS STRING) AS marketing_type,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:creative AS STRING) AS creative,
+              CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:traffic_source AS STRING) AS traffic_source,
+              CASE 
+                WHEN browser:is_embedded = TRUE THEN CONCAT(CAST(os:name AS STRING), ' App')
+                ELSE CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')
+              END AS device_type,
+              null as enrollment_device,
+              CAST(os:name AS STRING) AS operating_system,
+              session_id
+
+          FROM STREAMING_PLATFORM.SEGMENT_AND_HAWKER_PRODUCTION.WEB_EVENT_ROUTER_V1_WEB_ACTION_TRIGGERED
+          WHERE 1 = 1
+            AND unique_id = 'first_entry_point'
+            AND timestamp::DATE >= DATE '2025-05-08'
+       )
+    where 1=1
+
+
+lp_signup_cta_tapped_input :
+  type : input
+  connector: snowflake
+  query: >
+    select  id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') AS user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            false as is_embedded,
+            'Enter Enrollment CTA Tapped' event,
+            'ENTER_ENROLLMENT_CTA_TAPPED' as source_table,
+            context_page_url,
+            CASE
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'tp_' THEN 
+                'tp_' || COALESCE(
+                  cast(PARSE_URL(context_page_referrer, 1):parameters:ref as string),
+                  cast(PARSE_URL(context_page_url, 1):parameters:ref as string),
+                  ''
+                )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'cj' THEN 
+                'cj_' || COALESCE(
+                  cast(PARSE_URL(context_page_referrer, 1):parameters:pid as string),
+                  cast(PARSE_URL(context_page_url, 1):parameters:pid as string),
+                  ''
+                )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'impact' THEN 
+                COALESCE(
+                  cast(PARSE_URL(context_page_referrer, 1):parameters:ad_id as string),
+                  cast(PARSE_URL(context_page_url, 1):parameters:ad_id as string),
+                  ''
+                )
+              ELSE CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)
+            END AS ad_id,          
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_source AS STRING) AS utm_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_medium AS STRING) AS utm_medium,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_id AS STRING) AS utm_id,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_content AS STRING) AS utm_content,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_term AS STRING) AS utm_term,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gclid AS STRING) AS gclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:fbclid AS STRING) AS fbclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gad_source AS STRING) AS gad_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:irgwc AS STRING) AS irgwc,
+            CAST(PARSE_URL(context_page_url, 1):parameters:cadid AS STRING) AS cadid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+            CAST(PARSE_URL(context_page_url, 1):parameters:value_prop AS STRING) AS value_prop,
+            CAST(PARSE_URL(context_page_url, 1):parameters:marketing_type AS STRING) AS marketing_type,
+            CAST(PARSE_URL(context_page_url, 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+            CAST(PARSE_URL(context_page_url, 1):parameters:creative AS STRING) AS creative,
+            CAST(PARSE_URL(context_page_url, 1):parameters:traffic_source AS STRING) AS traffic_source,
+            CASE
+                  WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android Web'
+                  WHEN LOWER(context_user_agent) LIKE '%iphone%' THEN 'iPhone Web'
+                  WHEN LOWER(context_user_agent) LIKE '%ipad%' THEN 'iPad Web'
+                  WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac Web'
+                  WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows Web'
+                  WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                  WHEN LOWER(context_user_agent) LIKE '%facebook%' THEN 'Facebook Bot'
+                  WHEN LOWER(context_user_agent) LIKE '%google-speakr%' THEN 'Google Speaker'
+                  WHEN LOWER(context_user_agent) LIKE '%bb10%' OR LOWER(context_user_agent) LIKE '%kbd%' THEN 'Blackberry'
+                  WHEN LOWER(context_user_agent) LIKE '%google%' THEN 'Google Bot'
+                  WHEN LOWER(context_user_agent) LIKE '%bot%' OR LOWER(context_user_agent) LIKE '%spider%' THEN 'Other Crawlers'
+                  WHEN LOWER(context_user_agent) LIKE '%mobile%' THEN 'Other Mobile Web'
+                  ELSE 'All Other Devices'
+                END AS device_type,
+              null as enrollment_device,
+            CASE
+                  WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android'
+                  WHEN LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%' OR LOWER(context_user_agent) LIKE '%ios%' THEN 'iOS'
+                  WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows'
+                  WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac'
+                  WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                  ELSE 'Other OS'
+              END AS operating_system,
+            'na' as session_id
+    from SEGMENT.CHIME_PROD.ENTER_ENROLLMENT_CTA_TAPPED
+    where timestamp::date < date '2025-04-30'
+
+    union distinct
+
+    select  id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            false as is_embedded,
+            'Enter Enrollment CTA Tapped' event,
+            'LEAD_GENERATION_INTERACTION_CAPTURED' as source_table,
+            context_page_url,
+            CASE
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'tp_' THEN 
+                'tp_' || COALESCE(
+                  cast(PARSE_URL(context_page_referrer, 1):parameters:ref as string),
+                  cast(PARSE_URL(context_page_url, 1):parameters:ref as string),
+                  ''
+                )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'cj' THEN 
+                'cj_' || COALESCE(
+                  cast(PARSE_URL(context_page_referrer, 1):parameters:pid as string),
+                  cast(PARSE_URL(context_page_url, 1):parameters:pid as string),
+                  ''
+                )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'impact' THEN 
+                COALESCE(
+                  cast(PARSE_URL(context_page_referrer, 1):parameters:ad_id as string),
+                  cast(PARSE_URL(context_page_url, 1):parameters:ad_id as string),
+                  ''
+                )
+              ELSE CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)
+            END AS ad_id,          
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_source AS STRING) AS utm_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_medium AS STRING) AS utm_medium,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_id AS STRING) AS utm_id,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_content AS STRING) AS utm_content,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_term AS STRING) AS utm_term,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gclid AS STRING) AS gclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:fbclid AS STRING) AS fbclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gad_source AS STRING) AS gad_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:irgwc AS STRING) AS irgwc,
+            CAST(PARSE_URL(context_page_url, 1):parameters:cadid AS STRING) AS cadid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+            CAST(PARSE_URL(context_page_url, 1):parameters:value_prop AS STRING) AS value_prop,
+            CAST(PARSE_URL(context_page_url, 1):parameters:marketing_type AS STRING) AS marketing_type,
+            CAST(PARSE_URL(context_page_url, 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+            CAST(PARSE_URL(context_page_url, 1):parameters:creative AS STRING) AS creative,
+            CAST(PARSE_URL(context_page_url, 1):parameters:traffic_source AS STRING) AS traffic_source,
+            CASE
+                  WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android Web'
+                  WHEN LOWER(context_user_agent) LIKE '%iphone%' THEN 'iPhone Web'
+                  WHEN LOWER(context_user_agent) LIKE '%ipad%' THEN 'iPad Web'
+                  WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac Web'
+                  WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows Web'
+                  WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                  WHEN LOWER(context_user_agent) LIKE '%facebook%' THEN 'Facebook Bot'
+                  WHEN LOWER(context_user_agent) LIKE '%google-speakr%' THEN 'Google Speaker'
+                  WHEN LOWER(context_user_agent) LIKE '%bb10%' OR LOWER(context_user_agent) LIKE '%kbd%' THEN 'Blackberry'
+                  WHEN LOWER(context_user_agent) LIKE '%google%' THEN 'Google Bot'
+                  WHEN LOWER(context_user_agent) LIKE '%bot%' OR LOWER(context_user_agent) LIKE '%spider%' THEN 'Other Crawlers'
+                  WHEN LOWER(context_user_agent) LIKE '%mobile%' THEN 'Other Mobile Web'
+                  ELSE 'All Other Devices'
+                END AS device_type,
+              null as enrollment_device,
+              CASE
+                  WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android'
+                  WHEN LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%' OR LOWER(context_user_agent) LIKE '%ios%' THEN 'iOS'
+                  WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows'
+                  WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac'
+                  WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                  ELSE 'Other OS'
+                END AS operating_system,
+              'na' as session_id
+    from SEGMENT.CHIME_PROD.LEAD_GENERATION_INTERACTION_CAPTURED
+    where interaction_type = 'INTERACTION_TYPE_ENTER_ENROLLMENT_CTA_TAPPED'
+      and timestamp::date < date '2025-04-30'
+
+    union all 
+
+    select 
+          _message_id as id,
+          REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+          REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+          timestamp::date as date,
+          timestamp,
+          false as is_embedded,
+          'Enter Enrollment CTA Tapped' as event,
+          'web_item_clicked' as source_table,
+          CAST(page:url AS STRING) AS context_page_url,
+          CASE
+            WHEN SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2) = 'tp_' THEN 
+              'tp_' || COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ref as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ref as string),
+                ''
+              )
+            WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'cj' THEN 
+              'cj_' || COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:pid as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:pid as string),
+                ''
+              )
+            WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'impact' THEN 
+              COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ad_id as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ad_id as string),
+                ''
+              )
+            ELSE SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)
+          END AS ad_id,
+
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_source AS STRING) AS utm_source,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_medium AS STRING) AS utm_medium,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_id AS STRING) AS utm_id,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_content AS STRING) AS utm_content,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_term AS STRING) AS utm_term,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:gclid AS STRING) AS gclid,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:fbclid AS STRING) AS fbclid,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:gad_source AS STRING) AS gad_source,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:irgwc AS STRING) AS irgwc,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:cadid AS STRING) AS cadid,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:value_prop AS STRING) AS value_prop,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:marketing_type AS STRING) AS marketing_type,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:creative AS STRING) AS creative,
+          CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:traffic_source AS STRING) AS traffic_source,
+          CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web') AS device_type,  
+          null AS enrollment_device,
+          CAST(os:name AS STRING) AS operating_system,
+          session_id
+    from           
+      streaming_platform.segment_and_hawker_production.web_event_router_v1_web_item_clicked 
+      where unique_id = 'enrollment_cta_tapped' 
+        and timestamp::date >= date '2025-04-30'
+
+
+
+app_signup_cta_tapped_input :
+  type : input
+  connector: snowflake
+  query: >
+    select  id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            false as is_embedded,
+            device_id,
+            app_version,
+            'App Signup CTA Tapped' as event,
+            'SIGN_UP_BUTTON_TAPPED' as source_table,
+            concat(context_device_type,' App') as device_type,
+            null as enrollment_device,
+            context_device_type as operating_system,
+            'na' as session_id
+    from SEGMENT.CHIME_PROD.SIGN_UP_BUTTON_TAPPED
+    where timestamp::date < date '2025-04-30'
+
+    union all
+
+    select  
+            _message_id as id,
+            REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            false as is_embedded,
+            _device_id as device_id,
+            cast(app:version as string) as app_version,
+            'App Signup CTA Tapped' as event,
+            'MOBILE_ITEM_TAPPED' as source_table,
+            CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web') AS device_type,  
+            null AS enrollment_device,
+            CAST(os:name AS STRING) AS operating_system,
+            session_id
+    from streaming_platform.segment_and_hawker_production.mobile_event_router_v1_mobile_item_tapped
+    where unique_id = 'signup_button' 
+      and  timestamp::date >= date '2025-04-30' 
+
+
+
+
+app_welcome_screen_input :
+  type : input
+  connector: snowflake
+  query: >
+    select
+         distinct 
+         id,
+         REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+         REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+         date,
+         timestamp,
+         is_embedded,
+         app_version,
+         device_id,
+         event,
+         source_table,
+         user_enrolled_flag,
+         device_enrolled_flag,
+         user_enrollment_time,
+         device_enrollment_time
+    from edw_db.bio.stage_pre_enrollment_app_welcome
+
+
+enrollment_flow_entered_input :
+  type : input
+  connector: snowflake
+  query: >
+    select  id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            is_embedded,
+            'Enrollment Flow Entered' as event,
+            'ENROLLMENT_FLOW_ENTERED' as source_table,
+            context_page_url,
+            CASE
+            WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'tp_' THEN 
+                'tp_' || COALESCE(
+                    CAST(PARSE_URL(context_page_referrer, 1):parameters:ref AS STRING),
+                    CAST(PARSE_URL(context_page_url, 1):parameters:ref AS STRING),
+                    ''
+                )
+            WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'cj' THEN 
+                'cj_' || COALESCE(
+                    CAST(PARSE_URL(context_page_referrer, 1):parameters:pid AS STRING),
+                    CAST(PARSE_URL(context_page_url, 1):parameters:pid AS STRING),
+                    ''
+                )
+            WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'impact' THEN 
+                COALESCE(
+                    CAST(PARSE_URL(context_page_referrer, 1):parameters:ad_id AS STRING),
+                    CAST(PARSE_URL(context_page_url, 1):parameters:ad_id AS STRING),
+                    ''
+                )
+            ELSE CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)
+            END AS ad_id,
+
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_source AS STRING) AS utm_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_medium AS STRING) AS utm_medium,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_id AS STRING) AS utm_id,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_content AS STRING) AS utm_content,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_term AS STRING) AS utm_term,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gclid AS STRING) AS gclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:fbclid AS STRING) AS fbclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gad_source AS STRING) AS gad_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:irgwc AS STRING) AS irgwc,
+            CAST(PARSE_URL(context_page_url, 1):parameters:cadid AS STRING) AS cadid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+            CAST(PARSE_URL(context_page_url, 1):parameters:value_prop AS STRING) AS value_prop,
+            CAST(PARSE_URL(context_page_url, 1):parameters:marketing_type AS STRING) AS marketing_type,
+            CAST(PARSE_URL(context_page_url, 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+            CAST(PARSE_URL(context_page_url, 1):parameters:creative AS STRING) AS creative,
+            CAST(PARSE_URL(context_page_url, 1):parameters:traffic_source AS STRING) AS traffic_source,
+
+            -- Device Type
+            CASE
+                WHEN is_embedded = TRUE AND LOWER(context_user_agent) LIKE '%android%' THEN 'Android App'
+                WHEN is_embedded = TRUE AND (
+                    LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%'
+                ) THEN 'iOS App'
+                WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android Web'
+                WHEN LOWER(context_user_agent) LIKE '%iphone%' THEN 'iPhone Web'
+                WHEN LOWER(context_user_agent) LIKE '%ipad%' THEN 'iPad Web'
+                WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac Web'
+                WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows Web'
+                WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                WHEN LOWER(context_user_agent) LIKE '%facebook%' THEN 'Facebook Bot'
+                WHEN LOWER(context_user_agent) LIKE '%google-speakr%' THEN 'Google Speaker'
+                WHEN LOWER(context_user_agent) LIKE '%bb10%' OR LOWER(context_user_agent) LIKE '%kbd%' THEN 'Blackberry'
+                WHEN LOWER(context_user_agent) LIKE '%google%' THEN 'Google Bot'
+                WHEN LOWER(context_user_agent) LIKE '%bot%' OR LOWER(context_user_agent) LIKE '%spider%' THEN 'Other Crawlers'
+                WHEN LOWER(context_user_agent) LIKE '%mobile%' THEN 'Other Mobile Web'
+                ELSE 'All Other Devices'
+            END AS device_type,
+
+            -- Enrollment Device
+            CASE
+                WHEN is_embedded = TRUE THEN 'Mobile App'
+                WHEN is_embedded = FALSE AND (
+                    LOWER(context_user_agent) LIKE '%macintosh%' OR
+                    LOWER(context_user_agent) LIKE '%windows%' OR
+                    LOWER(context_user_agent) LIKE '%linux%' OR
+                    LOWER(context_user_agent) LIKE '%x11%'
+                ) THEN 'Desktop Web'
+                ELSE 'Mobile Web'
+            END AS enrollment_device,
+
+            -- Operating System
+            CASE
+                WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android'
+                WHEN LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%' OR LOWER(context_user_agent) LIKE '%ios%' THEN 'iOS'
+                WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows'
+                WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac'
+                WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                ELSE 'Other OS'
+            END AS operating_system,
+            'na' AS session_id
+    from  SEGMENT.CHIME_PROD.ENROLLMENT_FLOW_ENTERED
+    where timestamp::date < date '2025-04-30'
+
+    union all 
+
+    select  
+            _message_id as id,
+            REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            cast(browser:is_embedded as boolean) as is_embedded,          
+            'Enrollment Flow Entered' as event,
+            'WEB_FLOW_STATUS_CHANGED' as source_table,
+            CAST(page:url AS STRING) AS context_page_url,
+            CASE
+                WHEN SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2) = 'tp_' THEN 
+                  'tp_' || COALESCE(
+                    cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ref as string),
+                    cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ref as string),
+                    ''
+                  )
+                WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'cj' THEN 
+                  'cj_' || COALESCE(
+                    cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:pid as string),
+                    cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:pid as string),
+                    ''
+                  )
+                WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'impact' THEN 
+                  COALESCE(
+                    cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ad_id as string),
+                    cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ad_id as string),
+                    ''
+                  )
+                ELSE SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)
+              END AS ad_id,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_source AS STRING) AS utm_source,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_medium AS STRING) AS utm_medium,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_id AS STRING) AS utm_id,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_content AS STRING) AS utm_content,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:utm_term AS STRING) AS utm_term,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:gclid AS STRING) AS gclid,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:fbclid AS STRING) AS fbclid,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:gad_source AS STRING) AS gad_source,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:irgwc AS STRING) AS irgwc,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:cadid AS STRING) AS cadid,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:value_prop AS STRING) AS value_prop,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:marketing_type AS STRING) AS marketing_type,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:creative AS STRING) AS creative,
+            CAST(PARSE_URL(CAST(page:url AS STRING), 1):parameters:traffic_source AS STRING) AS traffic_source,
+            CASE 
+              WHEN browser:is_embedded = TRUE THEN CONCAT(CAST(os:name AS STRING), ' App')
+              ELSE CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')
+            END AS device_type,  
+            CASE 
+              WHEN browser:is_embedded = TRUE THEN 'Mobile App'
+              WHEN browser:is_embedded = FALSE AND LOWER(CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')) IN ('windows web', 'mac web', 'linux web') THEN 'Desktop Web'
+              ELSE 'Mobile Web'
+            END AS enrollment_device,
+            CAST(os:name AS STRING) AS operating_syatem,
+            session_id
+    from   streaming_platform.segment_and_hawker_production.web_event_router_v1_web_flow_status_changed where unique_id ='enrollment_flow_entered'
+    and timestamp::date >= date '2025-04-30' 
+
+
+enrollment_section_completed_input :
+  type : input
+  connector: snowflake
+  query: >
+    select  id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            page_label,
+            is_embedded,
+            fields,
+            case when page_label ilike '%verify phone%'
+                or (page_label = 'Phone' and fields ilike '%verification%')
+                then 'Verify Phone Completed'
+                when page_label ilike '%activity%' then 'Activity Completed'
+                when page_label = 'CreditTermsOfService' then 'Terms Of Service Completed'
+                when page_label = 'AddressAutocompleteSmarty' then 'Address Completed'
+            else concat(page_label, ' Completed') end event,
+            'ENROLLMENT_SECTION_COMPLETED' as source_table,
+            context_page_url,
+            CASE
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'tp_' THEN 
+                  'tp_' || COALESCE(
+                      CAST(PARSE_URL(context_page_referrer, 1):parameters:ref AS STRING),
+                      CAST(PARSE_URL(context_page_url, 1):parameters:ref AS STRING),
+                      ''
+                  )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'cj' THEN 
+                  'cj_' || COALESCE(
+                      CAST(PARSE_URL(context_page_referrer, 1):parameters:pid AS STRING),
+                      CAST(PARSE_URL(context_page_url, 1):parameters:pid AS STRING),
+                      ''
+                  )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'impact' THEN 
+                  COALESCE(
+                      CAST(PARSE_URL(context_page_referrer, 1):parameters:ad_id AS STRING),
+                      CAST(PARSE_URL(context_page_url, 1):parameters:ad_id AS STRING),
+                      ''
+                  )
+              ELSE CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)
+                END AS ad_id,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_source AS STRING) AS utm_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_medium AS STRING) AS utm_medium,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_id AS STRING) AS utm_id,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_content AS STRING) AS utm_content,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_term AS STRING) AS utm_term,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gclid AS STRING) AS gclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:fbclid AS STRING) AS fbclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gad_source AS STRING) AS gad_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:irgwc AS STRING) AS irgwc,
+            CAST(PARSE_URL(context_page_url, 1):parameters:cadid AS STRING) AS cadid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+            CAST(PARSE_URL(context_page_url, 1):parameters:value_prop AS STRING) AS value_prop,
+            CAST(PARSE_URL(context_page_url, 1):parameters:marketing_type AS STRING) AS marketing_type,
+            CAST(PARSE_URL(context_page_url, 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+            CAST(PARSE_URL(context_page_url, 1):parameters:creative AS STRING) AS creative,
+            CAST(PARSE_URL(context_page_url, 1):parameters:traffic_source AS STRING) AS traffic_source,
+            -- Device Type
+            CASE
+                WHEN is_embedded = TRUE AND LOWER(context_user_agent) LIKE '%android%' THEN 'Android App'
+                WHEN is_embedded = TRUE AND (
+                    LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%'
+                ) THEN 'iOS App'
+                WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android Web'
+                WHEN LOWER(context_user_agent) LIKE '%iphone%' THEN 'iPhone Web'
+                WHEN LOWER(context_user_agent) LIKE '%ipad%' THEN 'iPad Web'
+                WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac Web'
+                WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows Web'
+                WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                WHEN LOWER(context_user_agent) LIKE '%facebook%' THEN 'Facebook Bot'
+                WHEN LOWER(context_user_agent) LIKE '%google-speakr%' THEN 'Google Speaker'
+                WHEN LOWER(context_user_agent) LIKE '%bb10%' OR LOWER(context_user_agent) LIKE '%kbd%' THEN 'Blackberry'
+                WHEN LOWER(context_user_agent) LIKE '%google%' THEN 'Google Bot'
+                WHEN LOWER(context_user_agent) LIKE '%bot%' OR LOWER(context_user_agent) LIKE '%spider%' THEN 'Other Crawlers'
+                WHEN LOWER(context_user_agent) LIKE '%mobile%' THEN 'Other Mobile Web'
+                ELSE 'All Other Devices'
+            END AS device_type,
+            -- Enrollment Device
+            CASE
+                WHEN is_embedded = TRUE THEN 'Mobile App'
+                WHEN is_embedded = FALSE AND (
+                    LOWER(context_user_agent) LIKE '%macintosh%' OR
+                    LOWER(context_user_agent) LIKE '%windows%' OR
+                    LOWER(context_user_agent) LIKE '%linux%' OR
+                    LOWER(context_user_agent) LIKE '%x11%'
+                ) THEN 'Desktop Web'
+                ELSE 'Mobile Web'
+            END AS enrollment_device,
+            -- Operating System
+            CASE
+                WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android'
+                WHEN LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%' OR LOWER(context_user_agent) LIKE '%ios%' THEN 'iOS'
+                WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows'
+                WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac'
+                WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                ELSE 'Other OS'
+            END AS operating_system,
+            'na' AS session_id
+    from segment.chime_prod.enrollment_section_completed
+    where user_id is not null
+        and page_label in ( 'Account'
+                           , 'Referral Account'
+                           , 'P2P Account'
+                           , 'Date of Birth'
+                           , 'Phone'
+                           , 'Verify Phone'
+                           , 'AddressAutocompleteSmarty'
+                           , 'Password'
+                           , 'Activity'
+                           , 'Social Security'
+                           , 'CreditTermsOfService')
+        and timestamp::date < date '2025-04-30'
+
+    union all 
+
+
+    select  
+          _message_id as id,
+          REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+          timestamp::date as date,
+          timestamp,
+          step_name as page_label,   --similar to page_label
+          cast(browser:is_embedded as boolean) as is_embedded,
+          fields,
+          case when step_name ilike '%verify phone%'
+              or (step_name = 'Phone' and fields ilike '%verification%') then 'Verify Phone Completed'
+              when step_name ilike '%activity%' then 'Activity Completed'
+              when step_name = 'CreditTermsOfService' then 'Terms Of Service Completed'
+              when step_name = 'AddressAutocompleteSmarty' then 'Address Completed'
+          else concat(step_name, ' Completed') end as event,
+          'web_form_submitted' as source_table,
+          cast(page:url as string) as context_page_url,
+          CASE
+            WHEN SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2) = 'tp_' THEN 
+              'tp_' || COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ref as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ref as string),
+                ''
+              )
+            WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'cj' THEN 
+              'cj_' || COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:pid as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:pid as string),
+                ''
+              )
+            WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'impact' THEN 
+              COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ad_id as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ad_id as string),
+                ''
+              )
+            ELSE SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)
+          END AS ad_id,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_source AS STRING) AS utm_source,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_medium AS STRING) AS utm_medium,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_id AS STRING) AS utm_id,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_content AS STRING) AS utm_content,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_term AS STRING) AS utm_term,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:gclid AS STRING) AS gclid,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:fbclid AS STRING) AS fbclid,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:gad_source AS STRING) AS gad_source,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:irgwc AS STRING) AS irgwc,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:cadid AS STRING) AS cadid,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:value_prop AS STRING) AS value_prop,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:marketing_type AS STRING) AS marketing_type,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:creative AS STRING) AS creative,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:traffic_source AS STRING) AS traffic_source,
+          CASE 
+            WHEN browser:is_embedded = TRUE THEN CONCAT(CAST(os:name AS STRING), ' App')
+            ELSE CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')
+          END AS device_type,
+          
+          CASE 
+            WHEN browser:is_embedded = TRUE THEN 'Mobile App'
+            WHEN browser:is_embedded = FALSE AND LOWER(CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')) IN ('windows web', 'mac web', 'linux web') THEN 'Desktop Web'
+            ELSE 'Mobile Web'
+          END AS enrollment_device,
+          CAST(os:name AS STRING) AS operating_system,
+          session_id
+    from streaming_platform.segment_and_hawker_production.web_event_router_v1_web_form_submitted 
+    where unique_id ='enrollment_section_completed' 
+            and step_name in ( 'Account'
+                           , 'Referral Account'
+                           , 'P2P Account'
+                           , 'Date of Birth'
+                           , 'Phone'
+                           , 'Verify Phone'
+                           , 'AddressAutocompleteSmarty'
+                           , 'Password'
+                           , 'Activity'
+                           , 'Social Security'
+                           , 'CreditTermsOfService') and form_name ='enrollment' 
+            and timestamp::date >= date '2025-04-30' 
+
+enrollment_section_view_input :
+  type : input
+  connector: snowflake
+  query: >
+    select  id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id, --null on account page
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            is_embedded, --  null on success page
+            concat(name,' Viewed') as event,
+            'PAGES' as source_table,
+            context_page_url,
+            CASE
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'tp_' THEN 
+                  'tp_' || COALESCE(
+                      CAST(PARSE_URL(context_page_referrer, 1):parameters:ref AS STRING),
+                      CAST(PARSE_URL(context_page_url, 1):parameters:ref AS STRING),
+                      ''
+                  )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'cj' THEN 
+                  'cj_' || COALESCE(
+                      CAST(PARSE_URL(context_page_referrer, 1):parameters:pid AS STRING),
+                      CAST(PARSE_URL(context_page_url, 1):parameters:pid AS STRING),
+                      ''
+                  )
+              WHEN LOWER(CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)) = 'impact' THEN 
+                  COALESCE(
+                      CAST(PARSE_URL(context_page_referrer, 1):parameters:ad_id AS STRING),
+                      CAST(PARSE_URL(context_page_url, 1):parameters:ad_id AS STRING),
+                      ''
+                  )
+              ELSE CAST(PARSE_URL(context_page_url, 1):parameters:ad AS STRING)
+            END AS ad_id,            
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_source AS STRING) AS utm_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_medium AS STRING) AS utm_medium,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_id AS STRING) AS utm_id,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_content AS STRING) AS utm_content,
+            CAST(PARSE_URL(context_page_url, 1):parameters:utm_term AS STRING) AS utm_term,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gclid AS STRING) AS gclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:fbclid AS STRING) AS fbclid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:gad_source AS STRING) AS gad_source,
+            CAST(PARSE_URL(context_page_url, 1):parameters:irgwc AS STRING) AS irgwc,
+            CAST(PARSE_URL(context_page_url, 1):parameters:cadid AS STRING) AS cadid,
+            CAST(PARSE_URL(context_page_url, 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+            CAST(PARSE_URL(context_page_url, 1):parameters:value_prop AS STRING) AS value_prop,
+            CAST(PARSE_URL(context_page_url, 1):parameters:marketing_type AS STRING) AS marketing_type,
+            CAST(PARSE_URL(context_page_url, 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+            CAST(PARSE_URL(context_page_url, 1):parameters:creative AS STRING) AS creative,
+            CAST(PARSE_URL(context_page_url, 1):parameters:traffic_source AS STRING) AS traffic_source,
+            -- Device Type
+            CASE
+                WHEN is_embedded = TRUE AND LOWER(context_user_agent) LIKE '%android%' THEN 'Android App'
+                WHEN is_embedded = TRUE AND (
+                    LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%'
+                ) THEN 'iOS App'
+                WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android Web'
+                WHEN LOWER(context_user_agent) LIKE '%iphone%' THEN 'iPhone Web'
+                WHEN LOWER(context_user_agent) LIKE '%ipad%' THEN 'iPad Web'
+                WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac Web'
+                WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows Web'
+                WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                WHEN LOWER(context_user_agent) LIKE '%facebook%' THEN 'Facebook Bot'
+                WHEN LOWER(context_user_agent) LIKE '%google-speakr%' THEN 'Google Speaker'
+                WHEN LOWER(context_user_agent) LIKE '%bb10%' OR LOWER(context_user_agent) LIKE '%kbd%' THEN 'Blackberry'
+                WHEN LOWER(context_user_agent) LIKE '%google%' THEN 'Google Bot'
+                WHEN LOWER(context_user_agent) LIKE '%bot%' OR LOWER(context_user_agent) LIKE '%spider%' THEN 'Other Crawlers'
+                WHEN LOWER(context_user_agent) LIKE '%mobile%' THEN 'Other Mobile Web'
+                ELSE 'All Other Devices'
+            END AS device_type,
+            -- Enrollment Device
+            CASE
+                WHEN is_embedded = TRUE THEN 'Mobile App'
+                WHEN is_embedded = FALSE AND (
+                    LOWER(context_user_agent) LIKE '%macintosh%' OR
+                    LOWER(context_user_agent) LIKE '%windows%' OR
+                    LOWER(context_user_agent) LIKE '%linux%' OR
+                    LOWER(context_user_agent) LIKE '%x11%'
+                ) THEN 'Desktop Web'
+                ELSE 'Mobile Web'
+            END AS enrollment_device,
+            -- Operating System
+            CASE
+                WHEN LOWER(context_user_agent) LIKE '%android%' THEN 'Android'
+                WHEN LOWER(context_user_agent) LIKE '%iphone%' OR LOWER(context_user_agent) LIKE '%ipad%' OR LOWER(context_user_agent) LIKE '%ios%' THEN 'iOS'
+                WHEN LOWER(context_user_agent) LIKE '%windows%' THEN 'Windows'
+                WHEN LOWER(context_user_agent) LIKE '%macintosh%' THEN 'Mac'
+                WHEN LOWER(context_user_agent) LIKE '%linux%' OR LOWER(context_user_agent) LIKE '%x11%' THEN 'Linux'
+                ELSE 'Other OS'
+            END AS operating_system,
+            'na' AS session_id
+    from SEGMENT.CHIME_PROD.PAGES
+    where name in ('Account Page'
+      , 'Referral Account Page'
+      , 'P2P Account Page'
+      , 'Date of Birth Page'
+      , 'Phone Page'
+      , 'Verify Phone Page'
+      , 'Address Page'
+      , 'Password Page'
+      , 'Activity Page'
+      , 'Social Security Number Page'
+      , 'Credit Day Zero Terms of Service Page'
+      , 'Success')
+      and timestamp::date < date '2025-04-30'
+
+      union all 
+
+      select  
+            _message_id as id,
+            REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            browser:is_embedded AS is_embedded,  
+            case
+                when page_id = 'p2p_account_page' then 'P2P Account Page View'
+                when page_id = 'date_of_birth_page' then 'Date of Birth Page View'
+                when page_id = 'credit_day_zero_terms_of_service_page' then 'Credit Day Zero Terms of Service Page View'
+                else INITCAP(REPLACE(page_id, '_', ' ')) || ' View'
+            end as event,
+            'WEB_PAGE_VIEWED' as source_table,
+            cast(page:url as string) as context_page_url,
+            CASE
+            WHEN SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2) = 'tp_' THEN 
+              'tp_' || COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ref as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ref as string),
+                ''
+              )
+            WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'cj' THEN 
+              'cj_' || COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:pid as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:pid as string),
+                ''
+              )
+            WHEN LOWER(SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)) = 'impact' THEN 
+              COALESCE(
+                cast(PARSE_URL(CAST(page:referrer AS STRING), 1):parameters:ad_id as string),
+                cast(PARSE_URL(CAST(page:url AS STRING), 1):parameters:ad_id as string),
+                ''
+              )
+            ELSE SPLIT_PART(REGEXP_SUBSTR(PARSE_URL(CAST(page:url AS STRING), 1):query, '(^|&)ad=([^&]*)'), '=', 2)
+           END AS ad_id,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_source AS STRING) AS utm_source,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_medium AS STRING) AS utm_medium,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_campaign AS STRING) AS utm_campaign,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_id AS STRING) AS utm_id,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_content AS STRING) AS utm_content,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:utm_term AS STRING) AS utm_term,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:gclid AS STRING) AS gclid,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:fbclid AS STRING) AS fbclid,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:gad_source AS STRING) AS gad_source,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:irgwc AS STRING) AS irgwc,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:cadid AS STRING) AS cadid,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:sub_publisher AS STRING) AS sub_publisher,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:value_prop AS STRING) AS value_prop,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:marketing_type AS STRING) AS marketing_type,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:publisher_short_name AS STRING) AS publisher_short_name,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:creative AS STRING) AS creative,
+          CAST(PARSE_URL(cast(_context:client_context:context:page:url AS string), 1):parameters:traffic_source AS STRING) AS traffic_source,
+          CASE 
+            WHEN browser:is_embedded = TRUE THEN CONCAT(CAST(os:name AS STRING), ' App')
+            ELSE CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')
+          END AS device_type,
+          
+          CASE 
+            WHEN browser:is_embedded = TRUE THEN 'Mobile App'
+            WHEN browser:is_embedded = FALSE AND LOWER(CONCAT(COALESCE(CAST(os:name AS STRING), 'Other'), ' Web')) IN ('windows web', 'mac web', 'linux web') THEN 'Desktop Web'
+            ELSE 'Mobile Web'
+          END AS enrollment_device,
+          CAST(os:name AS STRING) AS operating_system,
+          session_id
+      from STREAMING_PLATFORM.SEGMENT_AND_HAWKER_PRODUCTION.WEB_EVENT_ROUTER_V1_WEB_PAGE_VIEWED 
+      where page_id in ('account_page'
+                        , 'referral_account_page'
+                        , 'p2p_account_page'
+                        , 'date_of_birth_page'
+                        , 'phone_page'
+                        , 'verify_phone_page'
+                        , 'address_page'
+                        , 'password_page'
+                        , 'activity_page'
+                        , 'social_security_number_page'
+                        , 'credit_day_zero_terms_of_service_page'
+                        , 'success')
+      and timestamp::date >= date '2025-04-30' 
+
+
+
+enrollment_request_input :
+  type : input
+  connector: snowflake
+  query: >
+    select
+            id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            timestamp::date as date,
+            timestamp,
+            'Enrollment Requested' as event,
+            'ENROLLMENT_REQUEST_COMPLETED' as source_table
+    from SEGMENT.CHIME_PROD.ENROLLMENT_REQUEST_COMPLETED
+
+
+enrollment_request_succeed_input :
+  type : input
+  connector: snowflake
+  query: >
+    select
+            id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            timestamp::date as date,
+            timestamp,
+            'Enrollment Succeeded' as event,
+            'ENROLLMENT_REQUEST_COMPLETED' as source_table
+    from SEGMENT.CHIME_PROD.ENROLLMENT_REQUEST_COMPLETED
+    where enrollment_succeeded = TRUE
+
+
+download_cta_tapped_input :
+  type : input
+  connector: snowflake
+  query: >
+    select
+            id,
+            REGEXP_REPLACE(user_id, '^"|"$', '') as user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            false as is_embedded,
+            'App Download CTA Tapped' as event,
+            'DOWNLOAD_CTA_TAPPED' as source_table
+    from SEGMENT.CHIME_PROD.DOWNLOAD_CTA_TAPPED
+    where timestamp::date < date '2025-04-30'
+
+    union all 
+
+    select 
+            _message_id as id,
+            REGEXP_REPLACE(CAST(_user_id AS STRING), '^"|"$', '') AS user_id,
+            REGEXP_REPLACE(anonymous_id, '^"|"$', '') as anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            false as is_embedded,
+            'App Download CTA Tapped' as event,
+            'WEB_ITEM_CLICKED' as source_table
+      from streaming_platform.segment_and_hawker_production.web_event_router_v1_web_item_clicked
+      where unique_id= 'download_cta_tapped' 
+          and timestamp::date >= date '2025-04-30'
+
+member_redirect_input :
+  type : input
+  connector: snowflake
+  query: >
+    select
+            id,
+            user_id::varchar as user_id,
+            original_user_id::varchar as original_user_id,
+            anonymous_id,
+            timestamp::date as date,
+            timestamp,
+            'Enrollment Redirected To Login' as event,
+            matched_on,
+            matches,
+            'ENROLLMENT_REDIRECTED_TO_LOGIN' as source_table
+    from SEGMENT.CHIME_PROD.ENROLLMENT_REDIRECTED_TO_LOGIN
+    union all
+    select
+            _message_id as id,
+            enrolling_user_id::varchar as user_id,
+            active_user_id::varchar as original_user_id,
+            null as anonymous_id,
+            _creation_timestamp::date as date,
+            _creation_timestamp as timestamp,
+            'Enrollment User Conflict Found' as event,
+            null as matched_on,
+            null as matches,
+            'AUTHENTICATION_V1_ENROLLMENT_USER_CONFLICT_FOUND' as source_table
+    from STREAMING_PLATFORM.SEGMENT_AND_HAWKER_PRODUCTION.AUTHENTICATION_V1_ENROLLMENT_USER_CONFLICT_FOUND
+
+config:
+  type: bio
+  debug: False
+  cdc_column: timestamp
+  grain:
+    - id
+    - event
+  ranking_columns:
+    - timestamp
+  object: pre_enrollment
+
+  combine:
+    - enrollment_section_completed_input
+    - enrollment_section_view_input
+    - enrollment_request_input
+    - enrollment_request_succeed_input
+    - first_web_page_viewed_input
+    - download_cta_tapped_input
+    - app_welcome_screen_input
+    - lp_signup_cta_tapped_input
+    - enrollment_flow_entered_input
+    - app_signup_cta_tapped_input
+    - member_redirect_input
+
+
+
