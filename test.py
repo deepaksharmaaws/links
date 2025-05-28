@@ -2540,3 +2540,1311 @@ config:
 
 
 
+----------
+glue.py
+
+import datetime
+import json
+import os
+import shutil
+import sys
+
+from collections import defaultdict
+from datetime import timezone
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from py4j.java_gateway import java_import
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F, SQLContext
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
+
+from transformation.sdk import *
+from transformation.sdk.common import config
+from transformation.sdk.common.chime_df import ParserAwareDataFrame
+from transformation.sdk.common.log import Log
+
+
+class Glue:
+
+    def get_GlueArguments(self,
+                          default_args):
+        """
+
+        This is a wrapper for getResolvedOptions(). It accepts a dictionary containing command line arguments along with their default values.
+        If the command line arg doesn't contain the given argument key then the default value is returned in the final dictionary or args.
+
+        NOTE:
+            Define and use argument keys containing `_` and not `-` since getResolvedOptions() only accepts keys with `_`.
+            Reference: https://docs.aws.amazon.com/glue/latest/dg/aws-glue-api-crawler-pyspark-extensions-get-resolved-options.html
+
+        Arguments:
+            default_args - dict containing args with their default values
+
+        Returns:
+            dict -- dictionary containing all args along with the requested one(s) with or without their default(s).
+
+        """
+        aws_special_arguments = ['--security_configuration', '--job-bookmark-option', '--tempdir', '--job_id', '--job_run_id', '--job_name']
+        matched_arg_keys = []
+        if sys.argv:
+            for elem in sys.argv:
+                if elem.startswith(f'--') and elem.find('=') !=-1:
+                    matched_arg_keys.append(elem[2:elem.find('=')])
+                elif elem.startswith(f'--') and elem.lower() not in aws_special_arguments:
+                    matched_arg_keys.append(elem[2:])
+            retrieved_args = getResolvedOptions(sys.argv, matched_arg_keys)
+            default_args.update(retrieved_args)
+            return default_args
+
+        return default_args
+
+    def get_SparkContext(self):
+        return SparkContext.getOrCreate()
+
+    def get_GlueContext(self):
+
+        return GlueContext(self.sc)
+
+    def get_GlueSession(self):
+
+        spark = self.glueContext.spark_session
+        spark.conf.set("spark.sql.legacy.setCommandRejectsSparkCoreConfs", "false")  # this is introduced by spark 3.x and it's true by default
+        spark.conf.set("spark.sql.adaptive.fetchShuffleBlocksInBatch", "false")  # to resolve corrupted stream issue during shuffle fetch
+        spark.conf.set("spark.sql.adaptive.enabled", "false")  # Addressing Memory Leakage Issue. Note: this will be removed in Glue 4.0
+        spark.conf.set("spark.sql.sources.bucketing.autoBucketedScan.enabled", "false")  # Addressing Memory Leakage Issue
+        spark.conf.set("spark.sql.session.timeZone", DEFAULT_TIMEZONE)
+
+        for key in self.jobSettings:
+            spark.conf.set(key, self.jobSettings[key])
+        java_import(spark._jvm, config.SNOWFLAKE_SOURCE_NAME)
+
+        glue_version = config.Config().get_glue_version(self.folder, self.config_file)
+        if glue_version == "4.0":
+            self.log.info("Printing Spark configs.")
+            spark_conf = spark.sparkContext.getConf().getAll()
+            self.log.info(spark_conf)
+
+        return spark
+
+    def get_SQLContext(self):
+
+        return SQLContext(self.spark.sparkContext,
+                          self.spark)
+
+    def execute_query(self,
+                      query,
+                      table=None):
+        """
+        Transformation library facilates to build the ETL transformation logic. We can register the Dataframe as a table and write the transformation queries against the table.
+
+        API Call - glue.execute_query function will take three parameters:
+
+        Parameters:
+        query - It is a mandatory parameter. We can pass the transformation queries.
+        table - It is an optional parameter. Most of us going to SQL kind of ETL pipe, to enable subsequent ETL transformation logic, we need to specify this parameter. If you are comfortable writing programming kind of ETL pipeline, then you can skip this parameter.
+
+        SQL
+        df_session_cnt_by_date = glue.execute_query(session,'select date,count(*) from tmp_user_activity group by date','session_cnt_by_date')
+
+        API
+        df_session_cnt_by_date = df_session_cnt_by_date.groupby('date')
+        """
+
+        df = self.sqlContext.sql(query)
+
+        if table:
+            df.createOrReplaceTempView(table)
+        self.log.info("Dataframe is created for query ---" + query)
+        return ParserAwareDataFrame.assimilate(df, sql_query=query, name=table)
+
+    def __init__(self,
+                 job,
+                 folder,
+                 config_file):
+        """
+        Initialization library facilitates to make a session with glue/spark, SqlContext, and Snowflake connection. To build glue ETL pipeline, this is a first and mandatory library call in ETL pipeline. Once we received the session, we will use it through the ETL pipeline to make a call to other libraries. Developers need not worry about underlined glue, spark, and snowflake setup.
+
+        API Call - glue.init_session function will initialize Glue, Spark, SqlContext, and Snowflake connection and return the session object in form of a dictionary.  The job name is the mandatory parameter for this function. session object will be used to subsequently ETL pipeline.
+
+        session=glue.init_session("Build Device Session")
+        """
+
+        self.folder = folder
+        self.config_file = config_file
+        self.job_config = config.Config().parse_configuration(self.folder, self.config_file)
+        self.jobSettings = config.Config().get_job_setting(self.folder, self.config_file)
+        self.ENV = config.get_environment()
+        self.bucket = config.get_bucket()
+        self.job_status = 0
+        self.tags = {"owner": "Khandu Shinde", "group owner": "Karishma Dambe"}
+        self.custom_tags = None
+        self.log = Log(job, folder, self.tags, namespace=config.get_metrics_namespace_name())
+        self.OPS = config.set_execution_type()
+        # if JSSA is not enabled, sfOptions will hold default snowflake user/role;
+        # if JSSA is enabled, sfOptions will hold JSSA user/role, defaults are in sfOptions_backward_compatibility
+        # sfOptions_backward_compatibility will be removed once all jobs are onboarded to JSSA
+        self.sfOptions, self.sfOptions_backward_compatibility = config.get_credentials(self.config_file, self.jobSettings)
+        self.job = str(self.config_file).split(".")[0]
+        self.airtable_reference_id = "DE"
+        self.jobname = str(self.config_file).split(".")[0]
+        self.sc = self.get_SparkContext()
+        if self.jobSettings.get("spark.logLevel"):
+            self.sc.setLogLevel(self.jobSettings.get("spark.logLevel"))
+        self.glueContext = self.get_GlueContext()
+        self.spark = self.get_GlueSession()
+        self.sqlContext = self.get_SQLContext()
+        self.job = Job(self.glueContext)
+        self.parameters = config.Config().get_runtime_parameters(self.folder,
+                                                                 self.config_file,
+                                                                 self.get_GlueArguments(config.Config().get_job_parameters(self.folder, self.config_file)) if self.OPS != 'test' else config.Config().get_job_parameters(self.folder, self.config_file),
+                                                                 self.spark)
+        # Initialize backfill run and related attributes
+        self.is_backfill_run = self.parameters.get("IS_DTS_BACKFILL_DAG", "False").lower() == "true"
+        self.is_dqc_enabled = True
+        if self.is_backfill_run:
+            self._initialize_backfill_parameters()
+
+        self.log.info(f"JOB CONFIG::: {self.parameters}")
+
+        if 'tags' in self.parameters:
+            self.tags = self.parameters["tags"]
+            self.log.tags = self.tags
+        if 'warehouse' in self.parameters and self.ENV not in config.INTERACTIVE_SUPPORTED_ENV_LIST:
+            warehouse = self.parameters["warehouse"] if os.getenv('ENV') not in ["CI", "local", "docker", "de_sandbox", "nonprod"] else 'dev_wh'
+            self.sfOptions['sfWarehouse'] = warehouse
+            if self.sfOptions_backward_compatibility:
+                self.sfOptions_backward_compatibility['sfWarehouse'] = warehouse
+
+        if 'timezone' in self.parameters:
+            self.sfOptions['sfTimezone'] = self.parameters["timezone"]
+
+        if "role" in self.parameters and self.ENV not in config.INTERACTIVE_SUPPORTED_ENV_LIST:
+            role = self.parameters["role"] if os.getenv("ENV") not in ["CI", "local", "docker", "de_sandbox"] else config.DEFAULT_SNOWFLAKE_ROLE
+            if self.sfOptions_backward_compatibility:
+                # jssa is enabled, so we only override backward compatible role, jssa role will remain SA__{job_name}__ROLE
+                self.sfOptions_backward_compatibility["sfRole"] = role
+            else:
+                # jssa is not enabled, so we only override backward compatible role which is stored in sfOptions
+                self.sfOptions["sfRole"] = role
+
+        if 'logging_level' in self.parameters:
+            self.log.set_logging_level(self.parameters["logging_level"])
+
+        self.log.info("Job starting:1")
+        self.log.put_metric("jobstartedstatus", 1)
+        # !! DO NOT CHANGE the following log entry. It is needed in verbatim for downstream parsing. Tks
+        self.log.info("Job is started executing....")
+        self.log.info("Session has been initialized.")
+
+    def _initialize_backfill_parameters(self):
+        """
+        Initialize backfill instance and related attributes
+        :return: None
+        """
+        custom_tags = {
+            "job_name": self.jobname,
+            "job_type": "backfill",
+        }
+        self.log.put_metric(metric_name="glue.is_backfill_run", metric_value=1, custom_tags=custom_tags)
+        self.is_dqc_enabled = self.parameters.get("IS_DQC_ALERTING_ENABLED", "True").lower() != "false"
+        self.is_redirect_outputs = self.parameters.get("IS_REDIRECT_OUTPUTS", "False").lower() != "false"
+        if self.is_redirect_outputs:
+            self.redirection_tbl_suffix = self.parameters.get("REDIRECT_TABLE_SUFFIX", "_dts_backfill")
+            self.output_redirection_map = defaultdict(str)
+
+    def add_audit_attributes(self,
+                             df,
+                             attributes=None):
+        col_list = []
+        attr_cols = ""
+        job_name = self.jobname
+
+        if attributes:
+            for k, v in attributes.items():
+                col_list.append(("'" + v[0] + "'" if v[1] == 'N' else v[0]) + ' ' + k)
+                if k == 'meta_feature_family_name':
+                    self.custom_tags = {k: v[0]}
+            attr_cols = ", ".join(col_list) + ", "
+
+        df.registerTempTable("df")
+        sql_query = f"""
+            select *, {attr_cols} '{job_name}' as meta_job,
+                current_timestamp() as meta_dw_created_at,
+                current_timestamp() as meta_sink_event_timestamp
+            from df
+        """
+        attributes_df = self.execute_query(sql_query, "all_user_logs")
+        return attributes_df
+
+    def add_timestamp(self, df):
+        return df.withColumn('meta_dw_created_at', F.current_timestamp())
+
+    def register_function(self, function_name, function):
+
+        tmp_ref = udf(function, StringType())
+        self.spark.udf.register(function_name, tmp_ref)
+
+    def get_test_dataframe(self, test_data_file, file_format='csv', header=True, spark_connector_options=None):
+        read_options = {} if spark_connector_options is None else spark_connector_options
+        read_options.update({"header":header})
+        df = self.spark.read.format(str(file_format).lower()).load(path=test_data_file, **read_options)
+
+        return df
+
+    def load_test_dataframe(self, df, test_data_file, file_format='csv', spark_connector_options=None):
+        mode = "overwrite"
+        if os.path.exists(test_data_file):
+            if os.path.isfile(test_data_file):
+                os.remove(test_data_file)
+            else:
+                shutil.rmtree(test_data_file)
+        self.log.info(test_data_file)
+        write_options = {} if spark_connector_options is None else spark_connector_options
+        write_options.update({"header":True})
+        df.write.mode(mode).save(path=test_data_file, format=str(file_format).lower(), **write_options)
+
+    def get_dataframe_stats(self, table_name, timestamp=None, log_flag=True, max_time=None, min_time=None):
+
+        if timestamp:
+            df_stats = self.execute_query(
+                """ select
+                        '""" + table_name + """' dataframe,
+                        count(*) count,
+                        max(to_utc_timestamp(""" + timestamp + """,'UTC')) data_maxtime,
+                        min(to_utc_timestamp(""" + timestamp + """,'UTC')) data_mintime,
+                        current_timestamp job_runtime
+                  from """ + table_name)
+        else:
+            df_stats = self.execute_query(
+                """ select
+                        '""" + table_name + """' dataframe,
+                        count(*) count,
+                        current_timestamp job_runtime
+                  from """ + table_name)
+
+        stats = df_stats.toJSON().collect()
+        stats_dict = json.loads(stats[0])
+        try:
+            if max_time:
+                data_maxtime = datetime.datetime.strptime(str(max_time), '%Y-%m-%dT%H:%M:%S.%f%z').timestamp()
+            else:
+                data_maxtime = datetime.datetime.strptime(str(stats_dict['data_maxtime']), '%Y-%m-%dT%H:%M:%S.%f%z').timestamp()
+            if min_time:
+                data_mintime = datetime.datetime.strptime(str(min_time), '%Y-%m-%dT%H:%M:%S.%f%z').timestamp()
+            else:
+                data_mintime = datetime.datetime.strptime(str(stats_dict['data_mintime']), '%Y-%m-%dT%H:%M:%S.%f%z').timestamp()
+            job_runtime = datetime.datetime.strptime(str(stats_dict['job_runtime']), '%Y-%m-%dT%H:%M:%S.%f%z').timestamp()
+            latency = job_runtime - data_maxtime
+            if not min_time:
+                max_lag = job_runtime - data_mintime
+                self.log.put_metric("max_lag", max_lag)
+                self.log.info(f"Max Lag:{max_lag}")
+            if log_flag:
+                if latency < 0:
+                    self.log.info(f"Job Latency:{latency+25200}")
+
+                    self.log.info(f"airtable_reference_id:{self.airtable_reference_id} status:SUCCESS code:1", latency+25200, self.custom_tags)
+                else:
+                    self.log.info(f"Job Latency:{latency}")
+                    self.log.info(f"airtable_reference_id:{self.airtable_reference_id} status:SUCCESS code:1", latency, self.custom_tags)
+                log_string_list = []
+                for k in stats_dict:
+                    log_string_list.append(f"{k}:{stats_dict[k]}")
+                self.log.info(','.join(log_string_list))
+
+        except Exception as e:
+            self.log.info(f"Error parsing date: {e}")
+            self.log.info(str(e))
+        return stats_dict
+
+    def get_streaming_dataframe_stats(self):
+        df_stats = self.execute_query(
+            """ select
+                    max(to_utc_timestamp(window.end,'UTC')) data_maxtime
+                from batch """)
+        stats = df_stats.toJSON().collect()
+        stats_dict = json.loads(stats[0])
+        max_window_end = datetime.datetime.strptime(str(stats_dict['data_maxtime']), '%Y-%m-%dT%H:%M:%S.%f%z').replace(tzinfo=timezone.utc)
+        return max_window_end
+
+    def __del__(self):
+        if self.job_status:
+            if self.job_status == 0:
+                self.log.info(f"airtable_reference_id:{self.airtable_reference_id} status:FAILED code:1")
+            else:
+                self.log.info(f"airtable_reference_id:{self.airtable_reference_id} status:SUCCESS code:1")
+
+
+==========
+
+import copy
+import os
+import json
+import unicodedata
+from doctest import master
+from typing import Any, Dict, List, Optional, Union
+
+from pyspark.sql import SparkSession
+import boto3
+from botocore.exceptions import ClientError
+from transformation.sdk import *
+from transformation.sdk.aws_account_level_config import AWS_ACCOUNT_LEVEL_CONFIG
+from transformation.sdk.common.log import Log
+from transformation.sdk.common import init_job
+from transformation.sdk.common.constants import DEFAULT_GLUE_VERSION, GLUE3_FOLDERS
+import yaml
+from pyspark.sql import DataFrame
+import re
+
+"""
+These are the default parameters for AWS Glue configuration. These parameters are facilitating smooth code movement and
+etl pipeline logic across environment
+"""
+
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+BQL_LOG = "«SQL_LOG_TRACE»"
+BQL_END = "«_status_mutatum_est_»"
+
+if os.getenv("GLUE_ETL"):
+    master_path = os.getenv("GLUE_ETL")
+else:
+    master_path = ""
+
+etl_repo = "/transformation/"
+test_case_repo = "/transformation/test/"
+input_data_repo = "/transformation/test/sample_data/"
+s3_pipeline_path = "etl/glue/pipelines/"
+checkpoint_master_path = "/etl/glue/checkpoint/"
+watermark_folder = "sdk/common"
+data = "/data/"
+INTERACTIVE_ROLE_ARN_SUBSTR = ":assumed-role/dts-interactive-"
+INTERACTIVE_SUPPORTED_ENV_LIST = ["de_sandbox_interactive", "prod_interactive"]
+INTERACTIVE_USER_SECRETS_PREFIX = "/dts/glue_interactive_dev_user/v1"
+SNOWFLAKE_PROD_ENV_ALLOWED_LIST = [
+    "prod",
+    "prod_interactive",
+]
+
+NON_AWS_ENVS = ["CI", "local", "docker"]
+DEFAULT_SNOWFLAKE_ROLE = "GLUE_ETL_ROLE"
+
+
+def get_parameter(parameter: str) -> Any:
+    """
+    This API helps to retrieve secrets from AWS parameter store.
+    :param parameter: AWS SSM parameter name
+    :return: Return parameter value.
+    """
+    ssm = boto3.client("ssm", "us-east-1")
+    parameter = ssm.get_parameter(Name=parameter, WithDecryption=True)
+    return parameter["Parameter"]["Value"]
+
+
+def get_secret(secret_name: str) -> str:
+    """
+    Fetches the secret value from the AWS Secret Manager stored at the provided secret_name key.
+    :param secret_name: name of the secret to fetch from the AWS Secret Manager
+    :return: the secret value associated with the provided secret_name
+    """
+    client = boto3.client(service_name="secretsmanager", region_name="us-east-1")
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except ClientError as e:
+        # For a list of exceptions thrown, see
+        # https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+        raise e
+
+    # Decrypts secret using the associated KMS key.
+    secret = get_secret_value_response["SecretString"]
+    return secret
+
+
+def get_account() -> str:
+    """
+    This API helps to identify AWS environment at run time.
+    :return: Return AWS account number.
+    """
+    return boto3.client("sts").get_caller_identity().get("Account")
+
+
+def get_role_arn() -> str:
+    """
+    This API helps to identify the IAM role of the current AWS session.
+    :return: a string type denoting the IAM Role ARN of the current session.
+    """
+    role_arn = boto3.client("sts").get_caller_identity().get("Arn")
+    return role_arn
+
+
+def is_interactive_session() -> bool:
+    """
+    Check whether the current env is for interactive session
+    :return: return True if ENV environ is set to the value same as local var INTERACTIVE_ENV_NAME
+    """
+    role_arn = get_role_arn()
+    if INTERACTIVE_ROLE_ARN_SUBSTR in role_arn:
+        return True
+    return False
+
+
+def set_master_path() -> str:
+    """
+    This API helps to identify the master path for the given environment.
+    :return: (str)
+    """
+    if os.getenv("GLUE_ETL"):
+        master_path = os.getenv("GLUE_ETL")
+    else:
+        master_path = ""
+    return master_path
+
+
+def set_execution_type() -> str:
+
+    return init_job.set_execution_type()
+
+
+def get_value_from_env_account_level_config(
+    env: str, nested_key_name: str
+) -> Dict[str, Any]:
+    """
+    This function refers to AWS_ACCOUNT_LEVEL_CONFIG, and return the values for the nested key under
+    the provided env dictionary, raises Exception otherwise
+    :param env: the name of AWS env: all the supported AWS env for DTS
+    :param nested_key_name: the name of the nested key as founder env in the config file
+    :return: returns the string type value under account_level_config_dict[env][nested_key_name]
+    """
+    if (
+        env not in AWS_ACCOUNT_LEVEL_CONFIG
+        or nested_key_name not in AWS_ACCOUNT_LEVEL_CONFIG[env]
+    ):
+        raise Exception(
+            f"Nested value for key: {nested_key_name} not found for env: {env}"
+        )
+
+    return AWS_ACCOUNT_LEVEL_CONFIG[env][nested_key_name]
+
+
+def get_watermark_filename(env: str) -> str:
+    if os.getenv("ENV") in NON_AWS_ENVS:
+        return "operation_db_sql.yaml"
+
+    watermark_filename = get_value_from_env_account_level_config(
+        env=env, nested_key_name="operation_db_file_name"
+    )
+    return watermark_filename
+
+
+def get_environment() -> str:
+    if os.getenv("ENV") in NON_AWS_ENVS:
+        return os.getenv("ENV")
+
+    is_interactive = is_interactive_session()
+    current_aws_account_id = get_account()
+    for env, env_config in AWS_ACCOUNT_LEVEL_CONFIG.items():
+        if env_config["account_id"] == current_aws_account_id:
+            if not is_interactive:
+                return env
+            else:
+                if "_interactive" in env:
+                    return env
+
+    raise Exception(
+        f"Environment: env not defined in config json for account id: {current_aws_account_id}"
+    )
+
+
+def get_bucket(use_job_arg_override: bool = True) -> str:
+    """
+    Return the name of the pipeline bucket configured for the environment
+
+    :param force_env_bucket: ignore bucket override CLI argument
+    """
+    if use_job_arg_override:
+        override = init_job.get_pipeline_bucket_override()
+        if override is not None:
+            return override
+
+    if os.getenv("ENV") in NON_AWS_ENVS:
+        return "test"
+
+    env = get_environment()
+    return AWS_ACCOUNT_LEVEL_CONFIG[env]["pipeline_bucket_name"]
+
+
+def get_snowflake_url(env: Optional[str] = None) -> str:
+    """
+    Get the FQDN url of the Chime's snowflake account
+    :param env: string type defining the current environment
+    :return: a string type url corresponding to the Chime's account
+    """
+    url_suffix = "snowflakecomputing.com"
+    if env is None:
+        env = get_environment()
+    if env in SNOWFLAKE_PROD_ENV_ALLOWED_LIST:
+        account = "chime"
+    else:
+        account = "chime_dev"
+    return f"{account}.{url_suffix}"
+
+
+def get_credentials(config_file, jobSettings):
+    """
+    This API returns all the secrets at run time based on operation parameter. In case unit testing, it would not return
+    any results. For execution time, this API will return the secrets based on environment.
+    :param session: Job session.
+    :return: all the secrets at run time based on operation parameter.
+    """
+
+    timezone = get_timezone(jobSettings)
+    print("===========timezone for the job runtime is==========")
+    print(timezone)
+
+    sfOptions = {}
+    # stores backward compatible snowflake credentials: default ETL user, role and password
+    sfOptions_backward_compatibility = {}
+    env = get_environment()
+    if set_execution_type() != "test":
+        if env in INTERACTIVE_SUPPORTED_ENV_LIST:
+            user_email = get_dts_interactive_user_email()
+            sfOptions["sfURL"] = get_snowflake_url(env=env)
+            sfOptions["sfUser"] = user_email
+            sfOptions["sfAuthenticator"] = "oauth"
+            sfOptions["sfToken"] = get_secret(
+                f"{INTERACTIVE_USER_SECRETS_PREFIX}/{user_email}/token"
+            )
+            sfOptions["sfDatabase"] = get_secret(
+                f"{INTERACTIVE_USER_SECRETS_PREFIX}/{user_email}/database"
+            )
+            sfOptions["sfSchema"] = get_secret(
+                f"{INTERACTIVE_USER_SECRETS_PREFIX}/{user_email}/schema"
+            )
+            sfOptions["sfWarehouse"] = get_secret(
+                f"{INTERACTIVE_USER_SECRETS_PREFIX}/{user_email}/warehouse"
+            )
+            sfOptions["sfRole"] = get_secret(
+                f"{INTERACTIVE_USER_SECRETS_PREFIX}/{user_email}/role"
+            )
+            sfOptions["sfTimezone"] = timezone
+        elif env not in ["local", "docker"]:
+            sfOptions["sfURL"] = get_parameter("/data-transformation/glue/account")
+            sfOptions["sfDatabase"] = get_parameter(
+                "/data-transformation/glue/database"
+            )
+            sfOptions["sfSchema"] = get_parameter(
+                "/data-transformation/glue/database/schema"
+            )
+            sfOptions["sfWarehouse"] = get_parameter(
+                "/data-transformation/glue/warehouse"
+            )
+            sfOptions["sfTimezone"] = timezone
+            try:
+                # JSSA access credentials
+                job_name = config_file.rpartition('.')[0]
+                sfOptions["pem_private_key"] = get_secret(
+                    f"/dts/glue_etl_snowflake_setup/v1/{job_name}/private_key")
+                sfOptions["sfUser"] = f"{job_name.upper()}_USER"
+                sfOptions["sfRole"] = f"SA__{job_name.upper()}__ROLE"
+                sfOptions_backward_compatibility = copy.deepcopy(sfOptions)
+                sfOptions_backward_compatibility["sfUser"] = get_parameter(
+                    "/data-transformation/glue/database/user"
+                )
+                # backward compatibility credentials in case JSSA fails
+                sfOptions_backward_compatibility["sfPassword"] = get_parameter(
+                    "/data-transformation/glue/database/user/password"
+                )
+                sfOptions_backward_compatibility["sfRole"] = get_parameter(
+                    "/data-transformation/glue/database/user/role"
+                )
+                sfOptions_backward_compatibility.pop("pem_private_key", None)
+            except ClientError as e:
+                # use default backward compatibility credentials when not onboarded to JSSA
+                print(f"Retrieving JSSA credentials failed with {e}")
+                sfOptions["sfUser"] = get_parameter(
+                    "/data-transformation/glue/database/user"
+                )
+                sfOptions["sfPassword"] = get_parameter(
+                    "/data-transformation/glue/database/user/password"
+                )
+                sfOptions["sfRole"] = get_parameter(
+                    "/data-transformation/glue/database/user/role"
+                )
+            try:
+                fse_obs_db = get_parameter(
+                    "/data-transformation/glue/feature_store/obs_db"
+                )
+                fse_obs_db_user = get_parameter(
+                    "/data-transformation/glue/feature_store/obs_db/glue_user_secret_arn"
+                )
+                sfOptions["sfFSEObsDB"] = fse_obs_db
+                sfOptions["sfFSEObsDBUser"] = fse_obs_db_user
+                if sfOptions_backward_compatibility:
+                    sfOptions_backward_compatibility["sfFSEObsDB"] = fse_obs_db
+                    sfOptions_backward_compatibility["sfFSEObsDBUser"] = fse_obs_db_user
+            except ClientError:
+                sfOptions["sfFSEObsDB"] = ""
+                sfOptions["sfFSEObsDBUser"] = ""
+                if sfOptions_backward_compatibility:
+                    sfOptions_backward_compatibility["sfFSEObsDB"] = ""
+                    sfOptions_backward_compatibility["sfFSEObsDBUser"] = ""
+        else:
+            sfOptions["sfURL"] = os.getenv("SNOWSQL_DT_ACCOUNT")
+            sfOptions["sfUser"] = os.getenv("SNOWSQL_DT_USER")
+            sfOptions["sfPassword"] = os.getenv("SNOWSQL_DT_PWD")
+            sfOptions["sfDatabase"] = os.getenv("SNOWSQL_DATABASE")
+            sfOptions["sfSchema"] = os.getenv("SNOWSQL_SCHEMA")
+            sfOptions["sfWarehouse"] = os.getenv("SNOWSQL_DT_WAREHOUSE")
+            sfOptions["sfRole"] = os.getenv("SNOWSQL_ROLE")
+            sfOptions["sfTimezone"] = timezone
+
+    return sfOptions, sfOptions_backward_compatibility
+
+
+def get_timezone(jobSettings):
+    if jobSettings and "spark.sql.session.timeZone" in jobSettings:
+        return jobSettings["spark.sql.session.timeZone"]
+    return DEFAULT_TIMEZONE
+
+
+def get_amplitude_secrets() -> Dict[str, str]:
+    sfOptions = {}
+    if set_execution_type() != "test":
+        if get_environment() not in ["local", "docker"]:
+            sfOptions["amplitudeHawkerKey"] = get_parameter(
+                "/data-transformation/glue/amplitude/hawker/key"
+            )
+        else:
+            sfOptions["amplitudeHawkerKey"] = os.getenv("AMPLITUDE_HAWKER_KEY")
+    return sfOptions
+
+
+def get_test_file(
+    df_name: str, job_config: Dict[str, Any], folder: str, file: str
+) -> str:
+    return get_test_file_by_key(df_name, job_config, "test_data_file", folder, file)
+
+
+def get_test_file_by_key(
+    df_name: str,
+    job_config: Dict[str, Any],
+    df_file_path_key: str,
+    folder: str,
+    file: str,
+) -> str:
+
+    master_path = Config().get_master_path()
+    test_data_file = (
+        job_config[df_name][df_file_path_key] if df_file_path_key in job_config[df_name] else None
+    )
+    file_format = job_config[df_name]["file_format"] if "file_format" in job_config[df_name] else "csv"
+    folder_path = os.path.join(master_path, input_data_repo[1:], folder)
+
+    # feature-store connector uses this "test_data_file" field for different tests.
+    if master_path and test_data_file and df_file_path_key != 'test_data_file':
+        return f"{folder_path}/{test_data_file}"
+
+    params = {"job_config": job_config, "df_name": df_name, "folder_path": folder_path, "yaml_file": file}
+    if master_path and test_data_file and df_file_path_key == 'test_data_file':
+        params["test_data_file"] = test_data_file
+        return get_test_data_file_path(params)
+
+    if not test_data_file and df_name:
+        params["test_data_file"] = f"{df_name}.{file_format}"
+        return get_test_data_file_path(params)
+
+
+def get_test_data_file_path(params):
+    job_config = params["job_config"]
+    df_name = params["df_name"]
+    folder_path = params["folder_path"]
+    yaml_file = params["yaml_file"]
+    test_data_file = params["test_data_file"]
+    job_name = yaml_file.split(".")[0]
+
+    use_original_file_name = False
+    if job_config[df_name].get('type') == 'input' and "sample_data" not in job_config.get(f'test_{df_name}', {}) \
+            and job_config[df_name].get('test_data_file', None) is not None:
+        # DTS-2789: When a sample data file was manually uploaded, use the original file name.
+        use_original_file_name = True
+
+    if job_config[df_name].get('type') == 'output' and job_config[df_name].get('test_data_file', None) is not None \
+            and '/snowflake_etl/' in folder_path:
+        use_original_file_name = True
+
+    if use_original_file_name:
+        return f"{folder_path}/{test_data_file}"
+
+    return f"{folder_path}/{job_name}__{test_data_file}"
+
+
+def get_value(df: DataFrame, single_value: bool = True):
+
+    result = df.toJSON().collect()
+    for record in result:
+        data = json.loads(record)
+        if single_value:
+            for key in data:
+                return data[key]
+        else:
+            return data
+
+
+def get_dataframe_schema(dataframe: DataFrame) -> Dict[str, str]:
+    schema = {}
+    for i in dataframe.dtypes:
+        data_type = i[1].split("(")[0]
+        schema[i[0].lower()] = data_type
+    return schema
+
+
+def get_feature_columns(
+    dataframe: DataFrame, return_type: str = "str"
+) -> Union[List[str], str]:
+    schema = get_dataframe_schema(dataframe)
+    features = []
+    for key in schema:
+        if key not in [
+            "meta_feature_family_name",
+            "meta_dw_created_at",
+            "meta_sink_event_timestamp",
+            "meta_job",
+            "expiration_ts",
+        ]:
+            features.append(key)
+
+    if return_type != "str":
+        return features
+
+    return ",".join(features)
+
+
+def get_dataframe_compare_condition(
+    source_dataframe,
+    target_dataframe,
+    grain_cols: List[str],
+    exclude_delta_column_list: List[str],
+) -> str:
+    source_schema = get_dataframe_schema(source_dataframe)
+    target_schema = get_dataframe_schema(target_dataframe)
+    target_schema.pop("expiration_ts", None)
+    source_schema.pop("expiration_ts", None)
+    if len(get_feature_columns(source_dataframe, "columns")) == len(
+        get_feature_columns(target_dataframe, "columns")
+    ):
+        conditions = " 1=1 "
+        for col in grain_cols:
+            conditions += f"  and s.{col} == t.{col}  " ""
+        conditions += " where "
+        for col in target_schema:
+            if (
+                col in source_schema
+                and col not in grain_cols
+                and col
+                not in [
+                    "meta_feature_family_name",
+                    "meta_dw_created_at",
+                    "meta_sink_event_timestamp",
+                    "meta_job",
+                ]
+                and col not in exclude_delta_column_list
+            ):
+                if source_schema[col] in ["string", "text"]:
+                    conditions += (
+                        f"""coalesce( s.{col},'') != coalesce(t.{col},'') or """
+                    )
+                elif source_schema[col] in [
+                    "decimal",
+                    "integer",
+                    "float",
+                    "long",
+                    "bigint",
+                    "double",
+                ]:
+                    conditions += f"""coalesce( s.{col},0) != coalesce(t.{col},0) or """
+                elif source_schema[col] in ["date"] and target_schema[col] in ["date"]:
+                    conditions += f"""coalesce( s.{col},current_date) != coalesce(t.{col},current_date) or """
+                elif source_schema[col] in ["time", "timestamp", "datetime"]:
+                    conditions += f"""coalesce( s.{col},current_timestamp) != coalesce(t.{col},current_timestamp) or """
+                elif source_schema[col] in ["boolean"]:
+                    conditions += (
+                        f"""coalesce( s.{col},'true') != coalesce(t.{col},'true') or """
+                    )
+                else:
+                    conditions += f"""coalesce( s.{col},0) != coalesce(t.{col},0) or """
+
+        conditions = conditions.rstrip("or ")
+        return conditions
+    return ""
+
+
+def get_operation_db_and_stage_glue_schema(env: str) -> str:
+    """
+    This function reads the operation_db_name value for the provided env and returns the appropriate stage glue
+    schema for the env
+    :param env: the name of AWS env: all the supported AWS env for DTS
+    :return: a string type value in the format of <env_specific_operation_db_name>.stage_glue
+    """
+    if os.getenv("ENV") in NON_AWS_ENVS:
+        operation_db_name = "operation_db"
+    else:
+        operation_db_name = get_value_from_env_account_level_config(
+            env=env, nested_key_name="operation_db_name"
+        )
+    return f"{operation_db_name}.stage_glue"
+
+
+def get_operation_db_and_transformation_schema(env: str) -> str:
+    """
+    This function reads the operation_db_name value for the provided env and returns the appropriate transformation
+    schema name for the env
+    :param env: the name of AWS env: all the supported AWS env for DTS
+    :return: a string type value in the format of <env_specific_operation_db_name>.transformation
+    """
+    if os.getenv("ENV") in NON_AWS_ENVS:
+        operation_db_name = "operation_db"
+    else:
+        operation_db_name = get_value_from_env_account_level_config(
+            env=env, nested_key_name="operation_db_name"
+        )
+    return f"{operation_db_name}.transformation"
+
+
+def debug(df, count: int = 20, truncate_flag: bool = False):
+    df.show(count, truncate_flag)
+    df.explain()
+    df.printSchema()
+
+
+def get_metrics_namespace_name() -> str:
+    """
+    Get the cloudwatch namespace name where the metrics should be reported
+    :return: the name of the cloudwatch namespace, defaults to DTS
+    """
+    default_namespace_name = "DTS"
+    env = get_environment()
+    if env in INTERACTIVE_SUPPORTED_ENV_LIST:
+        return f"{default_namespace_name}_INTERACTIVE"
+    else:
+        return default_namespace_name
+
+
+def get_dts_interactive_user_email() -> str:
+    """
+    Get the cloudwatch namespace name where the metrics should be reported
+    :return: the name of the cloudwatch namespace, defaults to DTS
+    """
+    env = get_environment()
+    if env not in INTERACTIVE_SUPPORTED_ENV_LIST:
+        raise Exception("Current environment is not supported for interactive session")
+    role_arn = get_role_arn()
+    user_email = role_arn.rpartition(INTERACTIVE_ROLE_ARN_SUBSTR)[2].rpartition("/")[0]
+    return user_email
+
+
+class Config:
+    def __init__(self, session=None, use_job_arg_override: bool = True):
+        """
+        :param session: glue session unused.
+        :param force_env_bucket: force using the declared bucket name for this environment
+        """
+        self.session = session
+        self.OPS = set_execution_type()
+        self.ENV = get_environment()
+        self.master_path = set_master_path()
+        self.bucket = get_bucket(use_job_arg_override=use_job_arg_override)
+        self.log = Log(namespace=get_metrics_namespace_name())
+
+    def get_master_path(self) -> str:
+        """
+        This API returns the master path for the given environment.
+        :return: (str)
+        """
+        return self.master_path
+
+    def get_file_location(self, folder: str, filename: str) -> str:
+        """
+        This API returns fully qualified the job yaml configuration or unit testing file path.
+        :param folder: Folder name.
+        :param filename: File name.
+        :return:
+        """
+        if self.ENV not in NON_AWS_ENVS:
+            s3_client = boto3.client("s3")
+            bucket = self.bucket
+            s3_prefix = s3_pipeline_path
+            if is_interactive_session():
+                if "operation_db_" in filename:
+                    core_env_name = self.ENV.rpartition("_interactive")[0]
+                    bucket = get_value_from_env_account_level_config(
+                        env=core_env_name, nested_key_name="pipeline_bucket_name"
+                    )
+                else:
+                    user_email = get_dts_interactive_user_email()
+                    s3_prefix = os.path.join(user_email, s3_pipeline_path)
+            self.log.info(f"s3: path={bucket}, filename={filename}, folder={folder}")
+            response = s3_client.get_object(
+                Bucket=bucket, Key=s3_prefix + folder + "/" + filename
+            )
+            return response["Body"]
+        else:
+            return self.master_path + etl_repo + folder + "/" + filename
+
+    def parse_configuration(self, folder: str, filename: str) -> Dict[str, Any]:
+        """
+        This API parses job yaml configuration.
+        :param folder: Job configuration folder name
+        :param filename: Job configuration filename name
+        :return:
+        It will return YAML configuration dict
+        """
+        config = {}
+        if self.ENV not in NON_AWS_ENVS:
+            config = yaml.safe_load(self.get_file_location(folder, filename))
+        else:
+            with open(self.get_file_location(folder, filename)) as file:
+                config = yaml.load(file, Loader=yaml.FullLoader)
+
+        if config is not None and "include" in config:
+            parent_config = {}
+            parent_yaml_list = list(config["include"])
+            for parent in parent_yaml_list:
+                parent_split_list = str(parent).split(".")
+                parent_key = parent_split_list[0]
+                parent_config[parent_key] = self.parse_configuration(folder, parent)
+            for key in config:
+                if "query" in config[key] and str(config[key]["query"]).startswith("!"):
+                    query_ref = str(config[key]["query"])[1:]
+                    query_ref_list = query_ref.split(".")
+
+                    # loop through the yaml to find the target query
+                    # ex: query: "!merge_queries.merge_query.query"
+                    resolved_query = parent_config
+
+                    for sub_key in query_ref_list:
+                        if sub_key not in resolved_query:
+                            raise Exception(
+                                "Failed to resolve query ref: "
+                                + sub_key
+                                + " when looking for !"
+                                + query_ref
+                            )
+                        resolved_query = resolved_query[sub_key]
+
+                    config[key]["query"] = resolved_query
+        return config
+
+    def get_configuration(
+        self,
+        folder: str,
+        filename: str,
+        df_name: str,
+        query: Optional[str] = None,
+        df: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        It will setup the dataframe execution setting for the given ETL pipeline.
+        :param folder: Job configuration folder name
+        :param filename: Job configuration filename name
+        :param df_name: Dataframe name from the ETL pipeline
+        :param query: Data preparation or transformation query
+        :param df: default dataframe name in case of df_name is missing
+        :return:
+            It will return all the parameters in proper format to execute the dataframe.
+        """
+        parameters = {}
+        config = self.parse_configuration(folder, filename)
+        folder_path = os.path.join(self.master_path, input_data_repo[1:], folder)
+        for key in config[df_name]:
+            if key not in ("watermark", "type"):
+                if (
+                    config[df_name]["type"] in ["output", "input"]
+                    and key == "test_data_file"
+                    and self.ENV in NON_AWS_ENVS
+                ):
+                    params = {
+                        "job_config": config,
+                        "df_name": df_name,
+                        "folder_path": folder_path,
+                        "yaml_file": filename,
+                        "test_data_file": config[df_name][key]
+                    }
+                    parameters[key] = get_test_data_file_path(params)
+                else:
+                    if key == "grain_cols":
+                        grain_cols = []
+                        for col in config[df_name][key]:
+                            grain_cols.append(col)
+                        parameters[key] = grain_cols
+                    else:
+                        parameters[key] = config[df_name][key]
+
+        if (
+            config[df_name]["type"] in ["output", "input"]
+            and self.ENV in NON_AWS_ENVS
+            and config[df_name].get("test_data_file", None) is None
+        ):
+            params = {
+                "job_config": config,
+                "df_name": df_name,
+                "folder_path": folder_path,
+                "yaml_file": filename,
+                "test_data_file": df_name + "." + config[df_name].get("file_format", "csv")
+            }
+            parameters["test_data_file"] = get_test_data_file_path(params)
+
+        if query is not None and config[df_name]["type"] == "input":
+            parameters["query"] = query
+
+        if df_name is not None and config[df_name]["type"] == "input":
+            parameters["register_table"] = df_name
+        else:
+            parameters["df"] = df
+        return parameters
+
+    def get_test_configuration(
+        self, folder: str, filename: str, df_name: str
+    ) -> Dict[str, Any]:
+        """
+        It will setup the dataframe unit testing setting for the given ETL pipeline.
+        :param folder: Job configuration folder name
+        :param filename: Job configuration filename name
+        :param df_name: Dataframe name from the ETL pipeline
+        :return:
+            It will return all the parameters in proper format to test the dataframe.
+        """
+        parameters = {"folder": folder}
+        config = self.parse_configuration(folder, filename)
+
+        folder_path = os.path.join(self.master_path, input_data_repo[1:], folder)
+        default_name = df_name + "." + config[df_name].get("file_format", "csv")
+        params = {
+            "job_config": config,
+            "df_name": df_name,
+            "folder_path": folder_path,
+            "yaml_file": filename,
+            "test_data_file": config[df_name].get("test_data_file", default_name)
+        }
+        parameters["test_data_file"] = get_test_data_file_path(params)
+        parameters["register_table"] = df_name
+
+        if "file_format" not in config[df_name]:
+            parameters["file_format"] = "csv"
+        else:
+            parameters["file_format"] = config[df_name]["file_format"]
+        return parameters
+
+    def get_dataframe_configuration(
+        self, folder: str, filename: str, df_name: str, df: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        It will setup the dataframe unit testing setting for the given ETL pipeline.
+        :param folder: Job configuration folder name
+        :param filename: Job configuration filename name
+        :param df_name: Dataframe name from the ETL pipeline
+        :return:
+            It will return all the parameters in proper format to test the dataframe.
+        """
+        parameters = {}
+        if df:
+            parameters["df"] = df
+        config = self.parse_configuration(folder, filename)
+
+        for key in config[df_name]:
+            if key != "type":
+                parameters[key] = config[df_name][key]
+        if self.master_path:
+            folder_path = os.path.join(self.master_path, input_data_repo[1:], folder)
+            params = {
+                "job_config": config,
+                "df_name": df_name,
+                "folder_path": folder_path,
+                "yaml_file": filename,
+                "test_data_file": config[df_name]["test_data_file"]
+            }
+            parameters["test_data_file"] = get_test_data_file_path(params)
+        return parameters
+
+    def get_db_configuration(
+        self, folder: str, filename: str, df_name: str, df: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        It will setup the dataframe unit testing setting for the given ETL pipeline.
+        :param folder: Job configuration folder name
+        :param filename: Job configuration filename name
+        :param df_name: Dataframe name from the ETL pipeline
+        :return:
+            It will return all the parameters in proper format to test the dataframe.
+        """
+        parameters = {}
+        if df:
+            parameters["df"] = df
+        config = self.parse_configuration(folder, filename)
+
+        for key in config[df_name]:
+            if key != "type":
+                parameters[key] = config[df_name][key]
+
+        return parameters
+
+    @staticmethod
+    def clean_tags(tags: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Cleans any non ascii characters from job tags and replaces non-word characters with underscores.
+        :param tags: Dictionary of job tags
+        :return: Cleaned dictionary of job tags
+        """
+        cleaned_tags = {}
+        for key, value in tags.items():
+            if isinstance(value, str):
+                ascii_value = unicodedata.normalize("NFKD", value) \
+                    .encode("ascii", "ignore").decode("ascii")
+                cleaned_value = re.sub(r'[^A-Za-z0-9_.\-/ ]', '_', ascii_value)
+                cleaned_tags[key] = cleaned_value
+            else:
+                cleaned_tags[key] = value
+        return cleaned_tags
+
+    def get_watermark_configuration(
+        self, folder: str, filename: str, df_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        It will get watermark details
+        :param folder: Job configuration folder name
+        :param filename: Job configuration filename name
+        :param df_name: Dataframe name from the ETL pipeline
+        :return:
+            Will return dictionary that has watermark details
+        """
+        config = self.parse_configuration(folder, filename)
+        watermark = (
+            config[df_name]["watermark"] if config[df_name].get("watermark") else None
+        )
+        return watermark
+
+    def get_job_parameters(self, folder: str, config_file: str) -> Dict[str, Any]:
+        parameter_config = self.parse_configuration(folder, PARAMETER_CONFIG_FILE)
+        job_config = self.parse_configuration(folder, config_file)
+        default_config = (
+            parameter_config[DEFAULT_SECTION]
+            if parameter_config is not None and DEFAULT_SECTION in parameter_config
+            else {}
+        )
+        job_tags = (
+            job_config.get("job", {}).get("tags", {})
+        )
+        if job_tags:
+            default_config["tags"] = {**default_config.get("tags", {}), **job_tags}
+            default_config["tags"] = self.clean_tags(default_config["tags"])
+        job_parameter_config = (
+            job_config[PARAMETER_SECTION] if PARAMETER_SECTION in job_config else {}
+        )
+        final_config = {**default_config, **job_parameter_config}
+        return final_config
+
+    def get_job_setting(self, folder: str, config_file: str) -> Dict[str, Any]:
+        config = self.parse_configuration(folder, config_file)
+        if "job" in config and "setting" in config["job"]:
+            return config["job"]["setting"]
+
+        return {}
+
+    def is_spark_case_sensitive(self, folder: str, config_file: str) -> bool:
+        # DTS-2753: Make DTS be case-sensitive if the spark.sql.caseSensitive flag was set to true.
+        job_setting = self.get_job_setting(folder, config_file)
+        return job_setting.get('spark.sql.caseSensitive', False)
+
+    def _execute_query_with_backward_compatibility(self, spark, query, sfOptions, sfOptions_backward_compatibility, is_backward_compatible=False):
+        options = sfOptions if not is_backward_compatible else sfOptions_backward_compatibility
+        try:
+            # Attempt to execute the query
+            return (
+                spark.read.format("net.snowflake.spark.snowflake")
+                .options(**options)
+                .option("query", query)
+                .load()
+            )
+        except Exception as e:
+            # If primary execution fails, attempt fallback if available and not already attempted
+            if sfOptions_backward_compatibility and not is_backward_compatible:
+                self.log.error(
+                    f"Snowflake query execution failed under JSSA with {e}, now trying to execute "
+                    f"the same query with default Snowflake user and role"
+                )
+                return self._execute_query_with_backward_compatibility(spark, query,
+                                                                       sfOptions, sfOptions_backward_compatibility,
+                                                                       is_backward_compatible=True)
+            else:
+                # Raise the exception if fallback is unavailable or also fails
+                raise e
+
+    def get_runtime_parameters(
+        self,
+        folder: str,
+        config_file: str,
+        static_parameters: Dict[str, Any],
+        spark: Optional[SparkSession] = None,
+    ) -> Dict[str, Any]:
+        job_config = self.parse_configuration(folder, config_file)
+        runtime_parameters = {}
+        runtime_parameter_list = (
+            job_config["runtime_parameters"]
+            if "runtime_parameters" in job_config
+            else []
+        )
+        job_settings = (
+            job_config["job"]["setting"]
+            if "job" in job_config and "setting" in job_config["job"]
+            else {}
+        )
+        for runtime_parameter in runtime_parameter_list:
+            query = str(runtime_parameter["query"])
+            final_query = query.format(**static_parameters)
+            if self.OPS == "test":
+                print("GETTING DEFAULT VALUES FOR TESTING")
+                default_map = runtime_parameter["default"]
+                print(default_map)
+                runtime_parameters.update(default_map)
+            else:
+                sfOptions, sfOptions_backward_compatibility = get_credentials(config_file, job_settings)
+                if sfOptions_backward_compatibility:
+                    if (
+                        "warehouse" in static_parameters and self.ENV not in INTERACTIVE_SUPPORTED_ENV_LIST
+                        and os.getenv('ENV') not in ["CI", "local", "docker", "de_sandbox", "nonprod"]
+                    ):
+                        sfOptions["sfWarehouse"] = static_parameters["warehouse"]
+                        print(f"warehouse is overridden by parameters to {static_parameters['warehouse']} for JSSA")
+                    if (
+                        "snowflake" in job_config["job"] and "warehouse" in job_config["job"]["snowflake"]
+                        and os.getenv('ENV') not in ["CI", "local", "docker", "de_sandbox", 'nonprod']
+                    ):
+                        sfOptions["sfWarehouse"] = job_config["job"]["snowflake"]["warehouse"]
+                        print(f"warehouse is overridden by job config to {static_parameters['warehouse']} for JSSA")
+                df = self._execute_query_with_backward_compatibility(spark, final_query, sfOptions,
+                                                                     sfOptions_backward_compatibility)
+                for key, value in (
+                    df.rdd.map(lambda row: row.asDict()).collect()[0].items()
+                ):
+                    runtime_parameters.update({str(key): str(value)})
+        return {**static_parameters, **runtime_parameters}
+
+    def get_glue_version(self, folder: str, filename: str) -> str:
+        """
+        This method is to get the Glue version defined in its yaml file. Glue version was not specified, it will return
+        the default Glue version, which is 3.0 currently.
+
+        Parameters:
+        folder: Job configuration folder name
+        filename: Job configuration filename name
+
+        Returns:
+        A Glue version as string
+        """
+        glue_version = "4.0" if folder not in GLUE3_FOLDERS else DEFAULT_GLUE_VERSION
+        config = self.parse_configuration(folder, filename)
+        if "job" in config and "glue_version" in config["job"]:
+            return str(config["job"]["glue_version"])
+        return glue_version
