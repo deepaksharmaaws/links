@@ -29,3 +29,114 @@ resource "awscc_lakeformation_tag_association" "example" {
     }
   }
 }
+=====database:
+  name: demo_silver_db
+  tags:
+    Layer: Silver
+  tables:
+    - name: web_event_router_v1_web_vendor_action_triggered
+      tags:
+        Visibility: Private
+        Domain: Growth
+      columns:
+        - name: _event_context_event_producer
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_event_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_additional_context
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_app_version
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_name
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_campaign_term
+          tags:
+            DataSensitivity: Confidential
+    - name: mobile_event_router_v1_mobile_item_collapsed
+      tags:
+        Visibility: Private
+        Domain: Growth
+      columns:
+        - name: _event_context_event_producer
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_event_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_additional_context
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_app_version
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_name
+          tags:
+            DataSensitivity: Restricted
+        - name: _event_context_client_context_context_campaign_source
+          tags:
+            DataSensitivity: GoldPublic
+        - name: _event_context_client_context_context_campaign_term
+          tags:
+            DataSensitivity: Confidential
+
+===
+
+permissions:
+  - principal:
+      arn: "arn:aws:iam::925925731365:role/data-analyst-growth-role"
+      DATABASE:
+        - tags:
+            Layer:
+              - Silver
+          permissions:
+            - DESCRIBE
+
+      TABLE:
+        - tags:
+            Layer:
+              - Silver
+            DataSensitivity:
+              - Restricted
+              - Confidential
+              - GoldPublic
+            Visibility:
+              - Private
+              - Public
+          permissions:
+            - DESCRIBE
+            - SELECT
+  - principal:
+      arn: "arn:aws:iam::925925731365:role/data-owner-growth-role"
+      DATABASE:
+        - tags:
+            Layer:
+              - Silver
+            DataSensitivity:
+              - Restricted
+          permissions:
+            - DESCRIBE
+
+      TABLE:
+        - tags:
+            Layer:
+              - Silver
+            DataSensitivity:
+              - Restricted
+              - Confidential
+              - GoldPublic
+            Visibility:
+              - Private
+              - Public
+          permissions:
+            - DESCRIBE
+            - SELECT
+
+======
