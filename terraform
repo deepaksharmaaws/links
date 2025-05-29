@@ -83,6 +83,28 @@ terraform {
 }
 
 
+resource "aws_iam_role" "csr_ui_eks_task_execution_role" {
+  name = "csr-ui-eks-task-execution-role"
+
+resource "aws_iam_role": Indicates this is an AWS IAM role resource in Terraform
+"csr_ui_eks_task_execution_role": This is t he internal reference name used within Terraform
+name = "csr-ui-eks-task-execution-role" ,This is the name that appears in AWS
+
+resource "aws_iam_role" "dynamic_role" {
+  name = "${var.project}-${var.environment}-${var.purpose}-role"
+}
+
+resource "aws_iam_role" "project_environment_service_purpose_role" {
+  name = "${var.project}-${var.environment}-${var.service}-${var.purpose}-role"
+  
+  tags = {
+    Project     = var.project
+    Environment = var.environment
+    Service     = var.service
+    Purpose     = var.purpose
+    ManagedBy   = "Terraform"
+  }
+}
 
 ==========
 
