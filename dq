@@ -1,0 +1,29 @@
+Incremental Processing
+Captures and processes only new or modified data since last run
+Improves efficiency by avoiding full data reprocessing
+Change Data Capture (CDC)
+Tracks record-level modifications
+Identifies inserts and updates (delete tracking capability to be confirmed)
+Grain Column Management
+Enables duplicate detection
+Facilitates clean MERGE operations into Silver tables
+Record Ranking
+Supports data prioritization
+Note: Relevance for Silver ingestion needs clarification
+Data Quality (DQ) Framework
+Current DQ Rules:
+DQ1: Null value detection in grain columns
+DQ2: Duplicate record identification
+DQ3: Historical variance analysis (today vs. historical averages)
+DQ4: Sequential count validation between steps
+Key Questions for Implementation:
+DQ Rule Applicability
+Which rules are essential for Silver layer?
+Are all current rules adding value?
+DQ Check Timing
+PreDQ: What checks occur before processing?
+PostDQ: What validations happen after processing?
+DQ Failure Handling
+Do failed checks halt the pipeline?
+Or are they just logged for monitoring?
+What's the escalation process?
