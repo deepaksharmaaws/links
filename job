@@ -1,0 +1,1005 @@
+from transformation.sdk.self_serving_etl.job import Job
+
+etl = Job('dpl_agg_eni_employer', 'snowflake_etl/iceberg_bronze_to_silver', 'dpl_iceberg_bronze_to_silver_etl.yaml')
+source_df = etl.session.pro_iceberg.execute_query()
+  source_df.show()
+
+=====
+job.py
+
+
+import importlib
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+import yaml
+from transformation.sdk.backfill.backfill_metadata import BackFillMetadataHandler
+
+from transformation.sdk.common import config
+from transformation.sdk.streaming.glue_realtime import Streaming
+
+
+class Job:
+    def __init__(self,
+                 job,
+                 folder,
+                 file,
+                 window_size=None,
+                 checkpoint_location=None):
+
+        self.job = job
+        self.folder = folder
+        self.file = file
+        self.job_file = file.replace(".yaml", ".py")
+        self.session = Streaming(job, window_size, checkpoint_location, folder, file)
+        self.job_config = self.session.config.parse_configuration(self.folder, self.file)
+        self.etl_type = self.job_config.get("job", {}).get("type", "batch")
+        self.__set_session_settings()
+        if self.etl_type == "streaming":
+            self.__set_streaming_job_settings()
+        self.override_snowflake_parameter()
+
+        # Backfill run check and metadata handler initialization
+        self.backfill_metadata_handler = (
+            BackFillMetadataHandler(self.session.glue.jobname, self.session.glue.parameters, self.session.snowflake) if self.session.glue.is_backfill_run else None
+        )
+
+    def __set_session_settings(self) -> None:
+        self.session.glue.log.tags["etl_type"] = self.etl_type
+        self.session.debug_mode = True if (("debug_mode" in self.job_config["job"]
+                                            and self.job_config["job"]["debug_mode"] is True)
+                                           or ("debug_mode" in self.session.glue.parameters
+                                               and self.session.glue.parameters["debug_mode"].lower() == "true")) \
+            else False
+        self.session.glue.debug_mode = self.session.debug_mode
+
+        self.session.gather_status = False if "gather_status" in self.job_config["job"] \
+                                              and self.job_config["job"]["gather_status"] is False \
+            else True
+
+        if 'tags' in self.session.glue.parameters:
+            self.session.glue.log.tags.update(self.session.glue.parameters["tags"])
+
+
+    def __set_streaming_job_settings(self) -> None:
+        self.session.ges_source = True if "ges_source" in self.job_config["job"] else False
+        if "airtable_reference_id" in self.job_config["job"]:
+            self.session.glue.airtable_reference_id = self.job_config["job"]["airtable_reference_id"]
+
+        self.session.streaming_job = True
+        self.streaming_output_mode = self.job_config.get("job", {}).get("streaming_setting", {}).get("output_mode", "update")
+
+        self.streaming_type = self.job_config.get("job", {}).get("streaming_setting", {}).get("type", "stateful")
+
+        self.is_stateful = True if self.streaming_type == "stateful" else False
+        self.session.window_size = self.job_config.get("job", {}).get("window_size", "1 seconds")
+        if self.session.glue.OPS != 'test':
+            checkpoint_location = self.job_config["job"]["checkpoint_location"]
+            if "checkpoint_location" in self.session.glue.parameters:
+                checkpoint_location = self.session.glue.parameters["checkpoint_location"]
+                self.session.log.info(f"Setting checkpoint from job parameter = {checkpoint_location}")
+            self.session.checkpoint_location = self.session.s3.checkpoint_location(
+                f"""{self.streaming_type}/{self.file.replace(".yaml", "")}/{checkpoint_location}""",
+                self.session.glue.bucket)
+        else:
+            self.session.checkpoint_location = "/data-transformation/checkpoint/"
+
+    def override_snowflake_parameter(self) -> None:
+        if "snowflake" in self.job_config["job"] and os.getenv('ENV') not in ["CI", "local", "docker", "de_sandbox", 'nonprod']:
+            for key in self.job_config["job"]["snowflake"]:
+                if key in ['warehouse', 'role']:
+                    snowflake_key = f'sf{key.capitalize()}'
+                    val = self.job_config["job"]["snowflake"][key]
+                    snowflake_val = val
+                    if self.session.glue.sfOptions_backward_compatibility:
+                        self.session.glue.sfOptions_backward_compatibility[snowflake_key] = snowflake_val
+                    else:
+                        self.session.glue.sfOptions[snowflake_key] = snowflake_val
+                    if key == "warehouse":
+                        self.session.glue.sfOptions[snowflake_key] = snowflake_val
+
+    def register_udf(self):
+        if 'udf' in self.job_config:
+            udf_list = self.job_config['udf']
+            for udf in udf_list:
+                udf_module = "transformation.udf.redact_udf" if udf == "redact_column" else "transformation.udf.DtsUdf"
+                self.session.glue.register_function(udf, getattr(
+                    importlib.import_module(udf_module), udf))
+                self.session.log.info(f"Registered UDF {udf}")
+
+    def get_job_parameter(self, parameter_name: str, default_value: Optional[Any] = None) -> Any:
+        """
+        Get the parameter value from the job configuration.
+        :param parameter_name: Name of the parameter to fetch.
+        :param default_value: Default value to return if the parameter is not found.
+        :return: Parameter value.
+        """
+        if parameter_name in self.session.glue.parameters:
+            return self.session.glue.parameters[parameter_name]
+        elif default_value is not None:
+            return default_value
+        else:
+            raise KeyError(f"Parameter '{parameter_name}' not found in job configuration")
+
+
+    def get_input_snowflake_dataframe(self, input_config_name: Optional[str] = None, df_config: Optional[Dict[str, Any]] = None):
+        """
+        Fetch a DataFrame from Snowflake using the provided configuration.
+        :param input_config_name: Name of the input configuration to fetch the DataFrame.
+        :param df_config: Configuration dictionary for the DataFrame.
+        :return: DataFrame fetched from Snowflake.
+        """
+        if df_config is None and input_config_name is None:
+            raise ValueError("Either 'df_config' or 'input_config_name' must be provided")
+        if df_config is None and input_config_name is not None:
+            if input_config_name not in self.job_config:
+                raise ValueError(f"DataFrame '{input_config_name}' not found in job configuration")
+            df_config = self.job_config[input_config_name]
+            df_config["test_data_file"] = config.get_test_file(input_config_name, self.job_config, self.folder, self.file)
+        # for re-usable queries from query library
+        df_config["query"] = self.__get_query(df_config=df_config)
+        df = self.session.snowflake.get_dataframe(input_config_name, df_config)
+        self.session.register_table(df, input_config_name)
+        return df
+
+    def read_sources(self, schema=None, dataframe_name=None):
+        self.session.log.info("Started loading the sources dataframes....")
+        self._log_step_execution("read_sources", "starts")
+        for dataframe in self.job_config:
+            if not dataframe.startswith(
+                    "test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == "input":
+                df_config = {k: v for k, v in self.job_config[dataframe].items() if k != 'type' and k != "namespace"}
+                watermark = df_config.pop('watermark', None)
+                df_config["test_data_file"] = config.get_test_file(dataframe, self.job_config, self.folder, self.file)
+                if "connector" in self.job_config[dataframe]:
+                    if self.job_config[dataframe]["connector"] == "snowflake":
+                        df = self.get_input_snowflake_dataframe(input_config_name=dataframe, df_config=df_config)
+                    elif self.job_config[dataframe]["connector"] == "s3":
+                        df = self.session.read_s3(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "kinesis" and (dataframe_name is None or dataframe == dataframe_name):
+                        df_config["watermark"] = watermark
+                        # check if it's using fanner stream, if yes, kinesis stream name will always be job_name + "-production"
+                        if "source_streams_events" in self.job_config["job"]:
+                            df_config["stream"] = f"{self.job}-production"
+                        df = self.session.read_data_stream(dataframe, schema, df_config)
+                        df.createOrReplaceTempView(dataframe)
+                        return df
+                    elif self.job_config[dataframe]["connector"] == "kinesis_v2" and (dataframe_name is None or dataframe == dataframe_name):
+                        df_config["watermark"] = watermark
+                        if "source_streams_events" in self.job_config["job"]:
+                            df_config["stream"] = f"{self.job}-production"
+                        df = self.session.read_data_stream(dataframe, schema, df_config, is_v2_connector=True)
+                        df.createOrReplaceTempView(dataframe)
+                        return df
+                    elif self.job_config[dataframe]["connector"] == "kinesis_event_bus_pro":
+                        df_config["watermark"] = watermark
+                        df = self.session.read_data_stream_kinesis_event_bus_pro(dataframe, df_config)
+                        return df
+                    elif self.job_config[dataframe]["connector"] == "dynamodb":
+                        df = self.session.read_dynamodb(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "dynamodb_scan":
+                        df = self.session.scan_dynamodb(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "dynamodb_query":
+                        df = self.session.query_dynamodb(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "s3_data_lake_raw":
+                        df = self.session.read_s3_data_lake_raw(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "datalake":
+                        df = self.session.query_datalake(df_config)
+                        df.createOrReplaceTempView(dataframe)
+
+                if self.session.debug_mode and not str(self.job_config[dataframe]["connector"]).startswith("kinesis"):
+                    print(f"dataframe: {dataframe}")
+                    self.__debug(df)
+                    df.printSchema()
+
+        self._log_step_execution("read_sources", "ends")
+        self.session.log.info("All dataframes are read successfully!!!")
+
+    def lookup_dataframe(self):
+        self.session.log.info("Started looking the dataframes....")
+        self._log_step_execution("lookup_dataframe", "starts")
+        for dataframe in self.job_config:
+            if not dataframe.startswith(
+                    "test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == "lookup":
+                df_config = {k: v for k, v in self.job_config[dataframe].items() if k != 'type'}
+                df_config["test_data_file"] = config.get_test_file(dataframe, self.job_config, self.folder, self.file)
+                if "connector" in self.job_config[dataframe]:
+                    if self.job_config[dataframe]["connector"] == "snowflake":
+                        df = self.session.snowflake.get_dataframe(dataframe, df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "s3":
+                        df = self.session.read_s3(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "dynamodb":
+                        df = self.session.read_dynamodb(df_config)
+                        self.session.register_table(df, dataframe)
+                    elif self.job_config[dataframe]["connector"] == "dynamodb_scan":
+                        df = self.session.scan_dynamodb(df_config)
+                        self.session.register_table(df, dataframe)
+                if self.session.debug_mode and self.job_config[dataframe]["connector"] != "kinesis" and self.job_config[dataframe]["connector"] != "kinesis_event_bus_pro":
+                    print(f"dataframe: {dataframe}")
+                    self.__debug(df)
+                    df.printSchema()
+        self._log_step_execution("lookup_dataframe", "ends")
+        self.session.log.info("All dataframes are lookup successfully!!!")
+
+    def load_dataframe_in_snowflake(self, dataframe, output_config_name: Optional[str] = None, df_config: Optional[Dict[str, Any]] = None):
+        """Load a DataFrame into Snowflake using the provided configuration."""
+        if df_config is None and output_config_name is not None:
+            if output_config_name not in self.job_config:
+                raise ValueError(f"Output config name '{output_config_name}' not found in job configuration")
+            df_config = self.job_config[output_config_name]
+            df_config["test_data_file"] = config.get_test_file(output_config_name, self.job_config, self.folder, self.file)
+        if "object" not in df_config:
+            raise ValueError("The 'object' key must be present in the df_config dictionary")
+        df_config["object"] = str(df_config["object"]).format(**self.session.glue.parameters)
+        if self.session.glue.is_backfill_run and "object" in df_config:
+            if self.session.glue.is_redirect_outputs:
+                redirect_object = f"{df_config['object']}{self.session.glue.redirection_tbl_suffix}"
+                self.session.glue.output_redirection_map[df_config["object"]] = redirect_object
+                df_config["object"] = redirect_object
+        self.session.snowflake.load_dataframe(df_config, dataframe)
+
+    def load_targets(self, type="output", stats=None, df_config_name=None, df=None):
+        self.session.log.info(f"Starting loading the dataframes in targets with {type} mode....")
+        self._log_step_execution("load_targets", "starts")
+        for dataframe in self.job_config:
+            if not dataframe.startswith("test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == type:
+                self.session.glue.job_status = 0
+                df = self.session.glue.execute_query("select * from " + self.job_config[dataframe]["source"])
+                cnt = 1
+                if self.session.gather_status:
+                    df.persist()
+                    cnt = df.count()
+                    self.session.log.info(f"count:{cnt}")
+                if cnt > 0:
+                    if "audit_attributes" in self.job_config[dataframe]:
+                        df = self.session.glue.add_audit_attributes(df,
+                                                            self.job_config[dataframe]["audit_attributes"])
+                        if self.job_config[dataframe]["connector"] in ["kinesis", "kinesis_batch", "hawker"]:
+                            df = df.drop('meta_sink_event_timestamp')
+                            df = df.drop('meta_job')
+
+                    # send the count metric after we updated the custom_tags in 'add_audit_attributes' function above
+                    self.session.log.put_metric("recordscount", cnt, "Count", self.session.glue.custom_tags)
+                    self.session.log.info(f"Sent count: {cnt} to {self.session.glue.custom_tags}")
+
+                    if "add_timestamp" in self.job_config[dataframe] and self.job_config[dataframe]["add_timestamp"] is True:
+                        df = self.session.glue.add_timestamp(df)
+
+                    df_config = {k: v for k, v in self.job_config[dataframe].items() if k != 'type' and k != 'source' and k != "audit_attributes" and k != "confluence_url" and k != "add_timestamp" and k != "namespace"}
+                    df_config["test_data_file"] = config.get_test_file(dataframe, self.job_config, self.folder, self.file)
+
+                    if "connector" in self.job_config[dataframe]:
+                        if self.job_config[dataframe]["connector"] == "snowflake":
+                            self.load_dataframe_in_snowflake(df, df_config=df_config)
+                        elif self.job_config[dataframe]["connector"] == "s3":
+                            self.session.write_s3(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "kinesis":
+                            self.session.load_kinesis_stream(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "kinesis_batch":
+                            self.session.load_kinesis_stream_batch(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "kinesis_v2":
+                            # Checking dlq tag is enabled or not for the pipeline
+                            df_config["dlq"] = self.job_config["job"]["dlq"] if "job" in self.job_config and "dlq" in self.job_config["job"] else False
+                            self.session.load_kinesis_stream(df_config, df, is_v2_connector=True)
+                        elif self.job_config[dataframe]["connector"] == "kinesis_batch_v2":
+                            # Checking dlq tag is enabled or not for the pipeline
+                            df_config["dlq"] = self.job_config["job"]["dlq"] if "job" in self.job_config and "dlq" in self.job_config["job"] else False
+                            self.session.load_kinesis_stream_batch(df_config, df, is_v2_connector=True)
+                        elif self.job_config[dataframe]["connector"] == "dynamodb":
+                            self.session.load_dynamodb(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "dynamodb_update":
+                            self.session.update_dynamodb(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "dynamodb_update_map":
+                            # DTS-2753: Make DTS be case-sensitive if the spark.sql.caseSensitive flag was set to true.
+                            df_config['is_case_sensitive'] = self.session.config.is_spark_case_sensitive(
+                                self.folder, self.file)
+                            self.session.update_map_dynamodb(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "amplitude":
+                            self.session.load_amplitude(dataframe, df, df_config)
+                        elif self.job_config[dataframe]["connector"] == "hawker":
+                            # Checking dlq tag is enabled or not for the pipeline
+                            df_config["dlq"] = True
+                            self.session.load_hawker(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "hawker_batch":
+                            # Checking dlq tag is enabled or not for the pipeline
+                            df_config["dlq"] = True
+                            self.session.load_hawker(df_config, df, 'batch')
+                        elif self.job_config[dataframe]["connector"] == "feature-store":
+                            df_config["snowflake_source_test_data_file"] = config.get_test_file_by_key(dataframe, self.job_config, "snowflake_source_test_data_file", self.folder, self.file)
+                            df_config["metadata_input_test_file"] = config.get_test_file_by_key(dataframe, self.job_config, "metadata_input_test_file", self.folder, self.file)
+                            df_config["metadata_output_test_file"] = config.get_test_file_by_key(dataframe, self.job_config, "metadata_output_test_file", self.folder, self.file)
+                            df_config["snowflake_source_test_data_count_file"] = config.get_test_file_by_key(dataframe, self.job_config, "snowflake_source_test_data_count_file", self.folder, self.file)
+                            self.session.load_feature_store(df_config, df)
+                        elif self.job_config[dataframe]["connector"] == "datalake":
+                            self.session.log.info(f"Loading {dataframe} in Data Lake...")
+                            self.session.load_datalake(df_config, df)
+                    if stats:
+                        self.session.get_dataframe_stats(self.job_config[dataframe]["source"],
+                                                         None,
+                                                         True,
+                                                         stats['data_maxtime'],
+                                                         stats['data_mintime'])
+                else:
+                    self.session.log.info(f"No records found to write for config {dataframe}")
+                df.unpersist()
+                self.session.glue.custom_tags = None  # reset it for next iteration
+        self.session.glue.job_status = 1
+        self._log_step_execution("load_targets", "ends")
+        self.session.log.info(f"All dataframes are loaded successfully in Targets with {type} mode!!!")
+
+    def load_delta(self, df_config, source_df):
+        try:
+            self.session.log.info("Reading from lookup table....")
+            schema_conversion = df_config["schema_conversion"] if "schema_conversion" in df_config else []
+            parameters = {
+                "table": df_config["dyanmodb_table"],
+                "splits": self.get_splits_count(),
+                "schema_conversion": schema_conversion,
+                "connector": "dynamodb"
+            }
+            target_df = self.session.scan_dynamodb(parameters)
+
+            self.session.log.info(f"{df_config['dyanmodb_table']} read successfully!!!")
+            self.session.log.info("Identifying Delta change across batches....")
+            if target_df.count() > 0:
+                if "ttl" in df_config:
+                    self.session.register_table(target_df, "target_df")
+                    target_df = self.session.glue.execute_query(f"select * from target_df where  expiration_ts > cast((current_timestamp() - INTERVAL {df_config['ttl']} ) as long) ")
+                exclude_delta_column_list = []
+                if "exclude_delta_column_list" in df_config:
+                    exclude_delta_column_list = df_config["exclude_delta_column_list"]
+
+                conditions = config.get_dataframe_compare_condition(source_df, target_df, df_config["grain_cols"], exclude_delta_column_list)
+                print(conditions)
+                if conditions == "":
+                    delta_df = source_df
+                else:
+                    self.session.register_table(target_df, "target_df")
+                    self.session.register_table(source_df, "source_df")
+                    query = f"""select s.*
+                                from source_df s
+                                left outer join target_df t on  {conditions}"""
+                    self.session.log.info(query)
+                    delta_df = self.session.glue.execute_query(query)
+            else:
+                delta_df = source_df
+            self.session.log.info("Identified successfully!!!")
+            parameters = {k: v for k, v in df_config.items() if k != 'pk'
+                          and k != 'dyanmodb_table'
+                          and k != 'ttl'
+                          and k != 'grain_cols'
+                          and k != 'exclude_delta_column_list'
+                          and k != 'schema_conversion'}
+            delta_df.persist()
+            self.session.register_table(delta_df, "delta_df")
+            cnt = delta_df.count()
+            self.session.log.info(f"deltarecordscount:{cnt}")
+            self.session.log.put_metric("deltarecordscount", cnt)
+            self.session.load_kinesis_stream_batch(parameters, delta_df)
+
+            parameters = {
+                "table": df_config["dyanmodb_table"],
+                "connector": "dynamodb"
+            }
+            delta_df.createOrReplaceTempView("delta_df")
+            feature_list = config.get_feature_columns(delta_df)
+            if 'ttl' in df_config:
+                delta_df = self.session.glue.execute_query(f"""
+                select {feature_list},
+                cast((current_timestamp() + INTERVAL {df_config['ttl']} ) as long) as expiration_ts
+                from delta_df
+                where pk is not null""")
+
+            self.session.load_dynamodb(parameters, delta_df)
+            delta_df.unpersist()
+            self.session.log.info("Successfully identified Delta change across batches!!!")
+        except Exception as e:
+            print("Error while calculating and loading delta")
+            print(e)
+
+    def get_splits_count(self):
+        if "worker_counts" in self.job_config["job"]:
+            worker_counts = self.job_config["job"]["worker_counts"]
+        else:
+            worker_counts = 2
+
+        if "worker_type" in self.job_config["job"] and self.job_config["job"]["worker_type"] == "G.2X":
+            num_slots_per_executor = 16
+        else:
+            num_slots_per_executor = 8
+
+        return str(worker_counts*num_slots_per_executor)
+
+    def pre_check(self):
+        self.session.log.info("Starting Job Run Pre Checks....")
+        self._log_step_execution("pre_check", "starts")
+        for dataframe in self.job_config:
+            active = self.job_config[dataframe]["active"] if "active" in self.job_config[dataframe] else True
+            if not dataframe.startswith("test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == "pre_check" and active:
+                if "connector" in self.job_config[dataframe]:
+                    dqc_config = self.job_config[dataframe]
+                    dqc_config["query"] = self.__get_query(df_config=dqc_config)
+                    self.session.run_dqc_checks(dataframe, dqc_config, self.job, "pre_check")
+        self._log_step_execution("pre_check", "ends")
+        self.session.log.info("Job Run Pre Checks are passed!!!")
+
+    def run_dqc(self):
+        self.session.log.info("Starting Data Quality Checks....")
+        self._log_step_execution("run_dqc", "starts")
+        for dataframe in self.job_config:
+            active = self.job_config[dataframe]["active"] if "active" in self.job_config[dataframe] else True
+            if not dataframe.startswith("test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == "dqc" and active:
+                    if "connector" in self.job_config[dataframe]:
+                        dqc_config = self.job_config[dataframe]
+                        dqc_config["query"] = self.__get_query(df_config=dqc_config)
+                        self.session.run_dqc_checks(dataframe, dqc_config, self.job, "dqc")
+        self._log_step_execution("run_dqc", "ends")
+        self.session.log.info("Data Quality Checks are passed!!!")
+        total_execution_time = round((datetime.now()-self.session.log.start_time).total_seconds())
+        self.session.log.put_metric("jobexecutiontime", total_execution_time, "Seconds")
+
+    def run_pre_load_dqc(self):
+        self.session.log.info("Starting Data Quality Pre Load Checks....")
+        self._log_step_execution("run_pre_load_dqc", "starts")
+        for dataframe in self.job_config:
+            active = self.job_config[dataframe]["active"] if "active" in self.job_config[dataframe] else True
+            if not dataframe.startswith("test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == "pre_load_dqc" and active:
+                dqc_config = self.job_config[dataframe]
+                dqc_config["query"] = self.__get_query(df_config=dqc_config)
+                self.session.run_dqc_checks(dataframe, dqc_config, self.job, "pre_load_dqc")
+        self._log_step_execution("run_pre_load_dqc", "ends")
+        self.session.log.info("Data Quality Pre Load Checks are passed!!!")
+
+    def apply_transformation(self, type="transformation"):
+        self.session.log.info("Starting applying transformations....")
+        transformations = {}
+        for dataframe in self.job_config:
+            if not dataframe.startswith("test_") and dataframe != 'runtime_parameters' and dataframe != "include" and dataframe != "parameters" and dataframe != "udf" and \
+                    self.job_config[dataframe]["type"] == type:
+                transformations[self.job_config[dataframe]["execution_order"]] = [dataframe, self.job_config[dataframe]]
+
+        self._log_step_execution("apply_transformation", "starts")
+        for key in sorted(transformations):
+            query = self.__get_query(df_config=transformations[key][1])
+
+            query_after_parameter_substitution = str(query).format(**self.session.glue.parameters)
+            df = self.session.glue.execute_query(query_after_parameter_substitution)
+
+            if "is_persist" in transformations[key][1] and transformations[key][1]["is_persist"]:
+                df.persist()
+            if self.session.debug_mode:
+                print(f"transformation dataframe: {transformations[key][0]}")
+                self.__debug(df)
+                df.printSchema()
+            df.createOrReplaceTempView(transformations[key][0])
+
+        self._log_step_execution("apply_transformation", "ends")
+        self.session.log.info("Transformations are applied successfully!!!")
+
+    def __get_query(self, df_config: Dict[str, Any]) -> str:
+        """
+        This function is to get a SQL query statement from either a "query" parameter or a query library file.
+        This function works for the input, transformation, pre_check, dqc, and pre_load_dqc blocks.
+        :param df_config: a dataframe config. this is a mandatory parameter.
+        :return: a SQL query statement.
+        """
+        if "query" in df_config:
+            return df_config["query"]
+
+        # query library
+        folder, _, filename = str(df_config["library"]).rpartition("/")
+
+        if self.session.glue.ENV not in ["CI", "local", "docker", "jupyter"]:
+            query_library = yaml.safe_load(self.session.config.get_file_location(folder, filename))
+        else:
+            with open(self.session.config.get_file_location(folder, filename)) as file:
+                query_library = yaml.load(file, Loader=yaml.FullLoader)
+        query_function = query_library[df_config["function"]]
+        if "parameters" in df_config:
+            return str(query_function["query"]).format(**df_config["parameters"])
+        return str(query_function["query"])
+
+    def map_schema_to_columns(self, schemas):
+        self.session.log.info("Started mapping the schema with sources dataframes....")
+        for dataframe in self.job_config:
+            if not dataframe.startswith("test_") \
+                    and dataframe != "include" \
+                    and dataframe != "parameters" \
+                    and dataframe != "udf" \
+                    and self.job_config[dataframe]["type"] == "schema":
+                df = self.session.glue.execute_query("select * from " + self.job_config[dataframe]["source"])
+
+                if self.session.debug_mode:
+                    self.session.log.info("Before schema mapping..")
+                    df.printSchema()
+
+                df = self.session.map_schema_to_columns(df, dataframe, schemas, self.job_config[dataframe])
+                df.createOrReplaceTempView(dataframe)
+                self.session.log.info("Schema is applied successfully to sources dataframes!!!")
+                return df
+
+
+    def __debug(self, df, count=20, truncate_flag=False):
+        if self.session.debug_mode:
+            config.debug(df)
+
+    def _log_step_execution(self, step: str, status: str, tags: Dict[str, Any] = None):
+        custom_tags = {"step": step}
+        for t in [self.session.glue.custom_tags, tags]:
+            if isinstance(t, dict):
+                custom_tags = {**custom_tags, **t}
+        self.session.log.info(f"step {status}.", custom_tags=custom_tags)
+
+
+    def get_window_details(self):
+        for dataframe in self.job_config:
+            if not dataframe.startswith("test_") \
+                    and dataframe not in ['runtime_parameters', "include", "parameters", "udf"] \
+                    and self.job_config[dataframe]["type"] == "window":
+                return self.job_config[dataframe]
+
+    def get_complete_output_query(self):
+        join_condition = "1=1 "
+        df_config = self.get_window_details()
+        for col in df_config["grain"]:
+            join_condition += f" and coalesce(cast(s.{col} as string),'') = coalesce(cast(d.{col} as string),'')"
+        window = df_config["window_details"]
+        sliding_size = window["sliding_size"].split(" ")
+        size = max(int(sliding_size[0]), self.session.log.latency+5)
+        if sliding_size[1] == "seconds":
+            sliding_window_size = f"{size} {sliding_size[1]}"
+        else:
+            sliding_window_size = f"{size//60} {sliding_size[1]}"
+        query = f"""
+                    select s.*
+                    from batch s
+                        inner join (
+                        select * from batch
+                        where max__timestamp > (select
+                            max(max__timestamp) - INTERVAL {sliding_window_size} max__timestamp
+                            from batch)
+                        ) d on {join_condition}
+                    where s.max__timestamp > (select
+                            max(max__timestamp) - INTERVAL {window["size"]} max__timestamp
+                            from batch)
+                    """
+        self.session.log.info(query)
+        return query
+
+    def update_backfill_record(self, status: str, error_message: Optional[str] = None):
+        """
+        This function is to update the backfill record with the status and error message.
+        :param status: the status of the backfill record.
+        :param error_message: the error message of the backfill record.
+        """
+        self.session.log.info(f"Updating backfill record with status: {status} and error message: {error_message}")
+        if self.backfill_metadata_handler is not None:
+            self.backfill_metadata_handler.update_backfill_record(
+                status,
+                error_message
+            )
+
+    def start(self):
+        try:
+            if self.session.glue.OPS != "test" and self.session.glue.is_dqc_enabled:
+                self.pre_check()
+            self.register_udf()
+            self.read_sources()
+            self.apply_transformation()
+            if self.session.glue.OPS != "test" and self.session.glue.is_dqc_enabled:
+                self.run_pre_load_dqc()
+            self.load_targets()
+            if self.session.glue.OPS != "test" and self.session.glue.is_dqc_enabled:
+                self.run_dqc()
+            self.load_targets("post_load")
+
+            # If a watermark is enabled on a Snowflake input block, store the watermarks.
+            # This `persist_run_details` method can be called twice, but we will handle it in DTS-3812.
+            if len(self.session.snowflake.watermarks) > 0:
+                self.session.log.info("The persist_run_details function was called in the job.start()")
+                self.session.snowflake.persist_run_details()
+            # Update the backfill record with success.
+            self.update_backfill_record(status="SUCCESS")
+            self.session.job.commit()
+            self.session.log.info("Job completed successfully!!!")
+        except Exception as e:
+            self.session.log.error(f"Job failed with error: {e}")
+            # if the job fails, update the backfill record with the error message.
+            self.update_backfill_record(status="FAILED", error_message=str(e))
+            raise e
+
+
+    def start_realtime(self, df):
+
+        def processBatch(df, batchId):
+            self.session.log.info(f"Streaming macro-batch:{batchId} starting ...")
+            self._log_step_execution("read_sources", "starts")
+            self.session.glue.parameters["batch_id"] = str(batchId)
+            df.persist()
+            self.__debug(df)
+            self.session.register_table(df, 'batch')
+            if self.streaming_type == "stateful":
+                window = "max__timestamp"
+                if self.streaming_output_mode == "update":
+                    batch = self.session.execute_query("""select * from batch where window.end
+                                               = (select min(window.end) min_timestamp from batch)""", 'batch')
+                elif self.streaming_output_mode == "complete":
+                    batch = self.session.execute_query(self.get_complete_output_query(), 'batch')
+                else:
+                    batch = self.session.execute_query("""select * from batch where window.end
+                                               = (select max(window.end) min_timestamp from batch)""", 'batch')
+                    window = "window.end"
+                batch.persist()
+                self.session.register_table(batch, 'batch')
+                self.__debug(batch)
+            stats = None
+            max_window_end = None
+            if self.session.gather_status:
+                if self.session.ges_source or self.streaming_type == "stateless":
+                    stats = self.session.get_dataframe_stats('batch', "timestamp", False)
+                else:
+                    stats = self.session.get_dataframe_stats('batch', window, False)
+            else:
+                max_window_end = self.session.get_max_window_end()
+            self._log_step_execution("read_sources", "ends")
+            if df.count() > 0:
+                self.lookup_dataframe()
+                self.apply_transformation()
+                self.load_targets("output", stats)
+                if not self.session.gather_status:
+                    self.session.log_latency(datetime.now(timezone.utc), max_window_end)
+            else:
+                time_taken = round((datetime.now()-self.session.log.start_time).total_seconds())
+                self.session.log.info(f"airtable_reference_id:{self.session.glue.airtable_reference_id} status:SUCCESS code:1", time_taken)
+            for tmp_table in self.session.glue.spark.catalog.listTables():
+                self.session.glue.spark.catalog.dropTempView(f"{tmp_table.name}")
+            self.session.log.info(self.session.glue.spark.catalog.listTables())
+            self.session.log.info(f"Ended macro-batch:{batchId} successfully!!!")
+            df.unpersist()
+            if self.streaming_type == "stateful":
+                batch.unpersist()
+            self.session.log.start_time = datetime.now()
+
+        if self.streaming_type == "stateful":
+            self.session.log.info(f'{self.streaming_type} pipeline is running with '
+                                  f'{self.streaming_output_mode} output mode!!!!!')
+            streamingQuery = df \
+                .writeStream \
+                .foreachBatch(processBatch) \
+                .outputMode(self.streaming_output_mode) \
+                .trigger(processingTime=self.session.window_size) \
+                .option("checkpointLocation", self.session.checkpoint_location) \
+                .start()
+
+            streamingQuery.awaitTermination()
+            self.session.job.commit()
+        else:
+            self.session.log.info(f'{self.streaming_type} pipeline is running with '
+                                  f'{self.streaming_output_mode} output mode!!!!!')
+            self.session.start(df, processBatch)
+
+    def run_transformation(self, query, register_table=None):
+        return self.glue.execute_query(query, register_table)
+
+
+def job_config_initialization(folder, job):
+    etl = Job(job.replace('.yaml', ''), folder, job)
+    # This is for backward compatiability and fatten out objects path from three level to two level
+    etl.glue = etl.session.glue
+    etl.s3 = etl.session.s3
+    etl.kinesis = etl.session.kinesis
+    etl.iceberg = etl.session.iceberg
+    etl.config = etl.session.config
+    etl.dynamodb = etl.session.dynamodb
+    etl.snowflake = etl.session.snowflake
+    etl.dqc = etl.session.dqc
+    etl.log = etl.session.log
+    return etl
+
+
+
+========
+
+from transformation.sdk.batch.iceberg import Iceberg
+from transformation.sdk.streaming.s3 import S3
+from transformation.sdk.streaming.s3_data_lake_raw import S3DataLakeRaw
+from transformation.sdk.batch.glue import Glue
+from transformation.sdk.batch.snowflake import Snowflake
+from transformation.sdk.streaming.kinesis import Kinesis
+from transformation.sdk.connectors.kinesis_v2 import KinesisV2
+from transformation.sdk.datalake_testing.iceberg import IceBerg
+from transformation.sdk.streaming.kinesis_event_bus_pro import KinesisEventBusPro
+from transformation.sdk.feature_store.connector import FeatureStoreConnector
+from transformation.sdk.common.config import Config
+from transformation.sdk.common.dqc import DQC
+from awsglue import DynamicFrame
+from transformation.sdk.streaming.dynamodb import DynamoDB
+from pyspark.sql.functions import window
+from pyspark.sql import functions as f
+import importlib
+from datetime import datetime, timezone
+import os
+from typing import Dict, Any
+from transformation.sdk.common.chime_df import ParserAwareDataFrame
+from transformation.sdk.connectors.dts_utils import DTSUtils
+from transformation.sdk.connectors.dts_constants import GlobalConstants
+"""
+    This module helps to create AWS Glue streaming session.
+"""
+
+
+class Streaming:
+
+    def __init__(self,
+                 job,
+                 window_size=None,
+                 checkpoint_location=None,
+                 folder=None,
+                 config_file=None):
+        """
+        This API returns Glue Streaming Session
+        :param job: Job session
+        :param window_size: window size
+        :param checkpoint_location: checkpoint folder name
+        :return: Returns Streaming Glue Session
+        """
+        self.config = Config()
+        self.glue = Glue(job, folder, config_file)
+        self.job_config = self.config.parse_configuration(self.glue.folder, self.glue.config_file)
+        self.window_size = window_size
+        self.s3 = S3(self.glue)
+        self.s3_data_lake_raw = S3DataLakeRaw(self.glue)
+        self.kinesis = Kinesis(self.glue)
+        self.kinesis_v2 = KinesisV2(self.glue)
+        self.iceberg = IceBerg(self.glue)
+        self.pro_iceberg = Iceberg(self.glue)
+        self.kinesis_event_bus_pro = KinesisEventBusPro(self.glue)
+        self.dynamodb = DynamoDB(self.glue)
+        self.snowflake = Snowflake(self.glue)
+        self.dqc = DQC(self.glue, self.snowflake)
+        self.log = self.glue.log
+        job_name = config_file.replace(".yaml", "")
+        if not checkpoint_location:
+            checkpoint_location = job_name
+        if self.glue.OPS != 'test':
+            if "checkpoint_location" in self.glue.parameters:
+                checkpoint_location = self.glue.parameters["checkpoint_location"]
+                self.log.info(f"Setting checkpoint from job parameter = {checkpoint_location}")
+            self.checkpoint_location = self.s3.checkpoint_location(f"{job_name}/{checkpoint_location}",
+                                                                   self.glue.bucket)
+
+        self.glueContext = self.glue.glueContext
+        self.job = self.glue.job
+        self.debug_mode = False
+        self.amplitude = None
+        # Initializing amplitude module only when pipeline used amplitude connector
+        if DTSUtils.is_connector_type_exist(self.job_config, "amplitude"):
+            try:
+                imported_parent_module = importlib.import_module("transformation.sdk.streaming.amplitude")
+                amplitude_class = getattr(imported_parent_module, "Amplitude", None)
+                self.amplitude = amplitude_class(self.glue)
+                self.glue.log.put_metric("amplitude_source_code_import_failed", 0, 'Count')
+            except Exception as e:
+                self.glue.log.put_metric("amplitude_source_code_import_failed", 1, 'Count')
+                self.log.info(f"Failed to load amplitude.py with Exception {e}. Moving on...")
+                pass
+        self.feature_store = FeatureStoreConnector(self.glue)
+
+    def execute_query(self,
+                    query,
+                    dataframe=None):
+
+        df = self.glue.execute_query(
+            query,
+            dataframe)
+        return df
+
+    def get_kinesis_stream(self, df_config):
+
+        df = self.kinesis.read_kinesis_data_stream(**df_config)
+        self.log.info("Kinesis Stream is read successfully!!")
+        return df
+
+    def load_kinesis_stream(self, df_config, df, is_v2_connector=False):
+
+        if is_v2_connector:
+            self.log.info("Dataframe being loaded using V2!!")
+            self.kinesis_v2.publish(df, df_config)
+        else:
+            df_config["df"] = df
+            self.kinesis.load_kinesis_data_stream(**df_config)
+        self.log.info("Dataframe is loaded successfully on Kinesis Data-Stream !!")
+
+    def load_kinesis_stream_batch(self, df_config, df, is_v2_connector=False):
+
+        if is_v2_connector:
+            self.log.info("Dataframe being loaded using V2!!")
+            self.kinesis_v2.publish(df, df_config, is_batch=True)
+        else:
+            df_config["df"] = df
+            self.kinesis.load_kinesis_data_stream_batch(**df_config)
+        self.log.info("Dataframe is loaded successfully on Kinesis Data-Stream using batch !!")
+
+    def load_hawker(self, df_config, df, load_type=None):
+        self.log.info(f"dataframe is being loaded in Hawker Stream...")
+        stream = self.glue.config_file.replace(".yaml", "")
+        # Instead of creating another dictionary of kinesis params, passing the existing df_config
+        df_config["stream"] = f"dts_hawker_{stream}_stream"
+        self.kinesis_v2.publish(df, df_config, load_type == "batch")
+        self.log.info(f"Dataframe is loaded successfully on '{stream}' Hawker Data-Stream!!")
+
+    def load_feature_store(self, df_config, df):
+        self.log.info("dataframe is being loaded in Feature Store...")
+        feature_store_params = {
+            "test_data_file": df_config["test_data_file"],
+            "env": df_config.get("env", "staging"),
+            "metadata_file_location": df_config["metadata_file_location"],
+            "data_path_s3_prefix": df_config["data_path_s3_prefix"],
+            "snowflake_source_table": df_config["snowflake_source_table"],
+            "snowflake_source_test_data_file": df_config["snowflake_source_test_data_file"],
+            "metadata_input_test_file": df_config["metadata_input_test_file"],
+            "metadata_output_test_file": df_config["metadata_output_test_file"],
+            "snowflake_source_test_data_count_file": df_config["snowflake_source_test_data_count_file"],
+        }
+
+        if "records_per_file" in df_config:
+            feature_store_params["records_per_file"] = df_config["records_per_file"]
+        self.feature_store.load_data(**feature_store_params)
+        self.log.info(f"dataframe is loaded successfully in Feature Store!!")
+
+    def read_s3(self, df_config):
+        return self.s3.read_s3(df_config)
+
+    def write_s3(self, df_name, df):
+        self.s3.write_s3(df_name, df)
+
+    def query_datalake(self, df_config: Dict[str, Any]) -> ParserAwareDataFrame:
+        return self.iceberg.query(df_config)
+
+    def load_datalake(self, df_config: Dict[str, Any], df: ParserAwareDataFrame) -> None:
+        self.log.info(f"Loading to Data Lake")
+        self.iceberg.load(df, df_config)
+
+    def read_s3_data_lake_raw(self, df_config):
+        return self.s3_data_lake_raw.read(**df_config)
+
+    def read_dynamodb(self, df_config):
+
+        return self.dynamodb.incremental_read(**df_config)
+
+    def query_dynamodb(self, df_config):
+
+        return self.dynamodb.query(**df_config)
+
+    def scan_dynamodb(self, df_config):
+
+        return self.dynamodb.scan(**df_config)
+
+    def load_dynamodb(self, df_name, df):
+
+        self.dynamodb.load_dynamodb(df_name, df)
+
+    def update_dynamodb(self, df_name, df):
+
+        self.dynamodb.update_dynamodb(df_name, df)
+
+    def update_map_dynamodb(self, df_name, df):
+
+        self.dynamodb.update_map_dynamodb(df_name, df)
+
+    def load_amplitude(self, df_name, df, df_config):
+
+        region = df_config.get("region", None)
+        partition_count = df_config.get("partition_count", None)
+        params = {"stream": df_config["stream"]}
+        if region:
+            params["region"] = region
+        if partition_count:
+            params["partition_count"] = partition_count
+        self.log.info(f"Using data load params: {params}")
+        self.amplitude.load_amplitude(df_name, df, **params)
+
+    def start(self, frame,  function):
+
+        if self.glue.OPS != "test":
+            self.glueContext.forEachBatch(frame=frame,
+                                          batch_function=function,
+                                          options={"windowSize": self.window_size,
+                                                   "checkpointLocation": self.checkpoint_location})
+            self.job.commit()
+        else:
+            function(frame, 1)
+
+    def register_table(self, df, table_name, schema=None, timestamp='timestamp'):
+
+        datasource = DynamicFrame.fromDF(df, self.glueContext, "from_data_frame")
+        datasource.toDF().createOrReplaceTempView(table_name)
+
+        if schema:
+            df_schema = self.glue.execute_query(f"SELECT * FROM {table_name}")
+            df_schema = self.glue.spark.createDataFrame(df_schema.rdd, schema=schema)
+            datasource = DynamicFrame.fromDF(df_schema, self.glueContext, "from_data_frame")
+            datasource.toDF().createOrReplaceTempView(table_name)
+            self.log.info("Successfully assigned schema to dataframe!!" )
+
+        self.log.info(table_name + " table is registered successfully!!")
+
+    def get_dataframe_stats(self, table_name, timestamp='timestamp', log_flag=True, max_time=None, min_time=None):
+        return self.glue.get_dataframe_stats(table_name, timestamp, log_flag, max_time, min_time)
+
+    def get_max_window_end(self):
+        return self.glue.get_streaming_dataframe_stats()
+
+    def log_latency(self, current_time, max_window_end):
+        latency = round((current_time - max_window_end).total_seconds())
+        self.log.info(f"airtable_reference_id:{self.glue.airtable_reference_id} status:SUCCESS code:1", latency)
+        return latency
+
+    def get_streaming_features(self,
+                               source,
+                               window_details,
+                               grain,
+                               aggregate_function):
+
+        return source.groupBy(window(window_details["column"],
+                                     window_details["size"],
+                                     window_details["sliding_size"]),
+                              *grain).agg(f.min("timestamp").alias("min_timestamp"),
+                                          f.max("timestamp").alias("max_timestamp"),
+                                          f.count("*").alias("number_of_records"))
+
+    def read_data_stream(self, df_name, schema, df_config, is_v2_connector=False):
+        df_config["schemas"] = schema
+        df_config["register_table"] = df_name
+        if is_v2_connector:
+            df = self.kinesis_v2.read_data_stream(df_config)
+        else:
+            df = self.kinesis.read_data_stream(**df_config)
+        self.log.info("Kinesis Stream is read successfully!!")
+        return df
+
+    def read_data_stream_kinesis_event_bus_pro(self, df_name, df_config):
+
+        df_config["register_table"] = df_name
+        df_config["connector"] = 'kinesis'
+        df = self.kinesis_event_bus_pro.read_data_stream(**df_config)
+        self.log.info("Kinesis Event Bus Pro Stream has been read successfully!!")
+        return df
+
+    def map_schema_to_columns(self, dataframe, df_name, scheams, df_config):
+
+        df_config["schemas"] = scheams
+        df_config["register_table"] = df_name
+        df_config["dataframe"] = dataframe
+        del df_config["source"]
+        if "namespace" in df_config:
+            del df_config["namespace"]
+        df = self.kinesis.event_schema_mapping(**df_config)
+        self.log.info("Schema is applied successfully!!")
+        return df
+
+    def run_dqc_checks(self, dqc_name, dqc_config, job, type):
+
+        self.log.info(f"Running {type} for {dqc_name} ...")
+        dqc_config["type"] = type
+        self.dqc.execute(job, dqc_name, dqc_config)
+        self.log.info(f"Ran {type} for {dqc_name} successfully!!")
+
+
+
+========
